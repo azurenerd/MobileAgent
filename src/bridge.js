@@ -1,249 +1,242 @@
-import pty from 'node-pty';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { config } from './config.js';
-import { cleanOutput, stripEchoedInput } from './formatter.js';
+import { cleanOutput } from './formatter.js';
 
 /**
- * CopilotBridge manages the Copilot CLI process via a pseudo-terminal
- * and provides a clean event-based interface for sending/receiving messages.
+ * CopilotBridge v2 — Pipe mode process manager.
  *
- * States: starting → idle ↔ streaming → (error)
+ * Spawns a fresh `copilot -p <prompt>` per message with `--resume=<sessionId>`
+ * for conversation persistence. No PTY, no debounce — process exit = response complete.
  *
- * Events:
- *   'output'       - (cleanedText, rawText) assistant/CLI produced output
- *   'stateChange'  - (newState, oldState)
- *   'exit'         - (exitCode) CLI process exited
- *   'queued'       - (text, queueLength) message was queued because CLI is busy
- *   'error'        - (error) something went wrong
+ * Based on the AgentSquad pattern (CopilotCliProcessManager.cs).
  */
 export class CopilotBridge extends EventEmitter {
   constructor() {
     super();
-    this.state = 'stopped';
-    this.buffer = '';
-    this.rawBuffer = '';
-    this.debounceTimer = null;
-    this.process = null;
-    this.lastInput = null;
+    this.sessionId = null;
+    this.busy = false;
     this.messageQueue = [];
-    this.startTime = null;
+    this.currentProcess = null;
     this.requestCount = 0;
+    this.startTime = Date.now();
+    this._loadSession();
+  }
+
+  _loadSession() {
+    if (existsSync(config.stateFile)) {
+      try {
+        const state = JSON.parse(readFileSync(config.stateFile, 'utf-8'));
+        if (state.sessionId) {
+          this.sessionId = state.sessionId;
+          console.log(`[bridge] Resumed session: ${this.sessionId}`);
+          return;
+        }
+      } catch (err) {
+        console.warn(`[bridge] Failed to read state file: ${err.message}`);
+      }
+    }
+    this.sessionId = randomUUID();
+    this._saveSession();
+    console.log(`[bridge] New session: ${this.sessionId}`);
+  }
+
+  _saveSession() {
+    try {
+      writeFileSync(config.stateFile, JSON.stringify({
+        sessionId: this.sessionId,
+        createdAt: new Date().toISOString(),
+      }, null, 2));
+    } catch (err) {
+      console.error(`[bridge] Failed to save state: ${err.message}`);
+    }
+  }
+
+  /** Start a new conversation session. Returns the new session ID. */
+  newSession() {
+    this.sessionId = randomUUID();
+    this._saveSession();
+    console.log(`[bridge] New session: ${this.sessionId}`);
+    return this.sessionId;
+  }
+
+  /** Get current session ID. */
+  getSessionId() {
+    return this.sessionId;
   }
 
   /**
-   * Spawn the Copilot CLI in a pseudo-terminal.
+   * Send a message to Copilot. If busy, queues it.
+   * @param {string} text - The user's message
+   * @param {string[]} imagePaths - Optional array of local image file paths
+   * @returns {Promise<{text: string, exitCode: number}>}
    */
-  start() {
-    if (this.process) {
-      this.destroy();
+  async sendMessage(text, imagePaths = []) {
+    if (this.busy) {
+      return new Promise((resolve, reject) => {
+        this.messageQueue.push({ text, imagePaths, resolve, reject });
+        this.emit('queued', text, this.messageQueue.length);
+      });
     }
+    return this._executeMessage(text, imagePaths);
+  }
+
+  async _executeMessage(text, imagePaths = []) {
+    this.busy = true;
+    this.requestCount++;
+    this.emit('busy', true);
 
     try {
-      this.process = pty.spawn(config.copilot.path, [], {
-        name: 'xterm-256color',
-        cols: config.pty.cols,
-        rows: config.pty.rows,
-        cwd: config.copilot.cwd,
-        env: { ...process.env },
-      });
-    } catch (err) {
-      this._setState('error');
-      this.emit('error', err);
-      return;
-    }
-
-    this.process.onData((data) => this._handleOutput(data));
-
-    this.process.onExit(({ exitCode, signal }) => {
-      console.log(`[bridge] CLI exited: code=${exitCode} signal=${signal}`);
-      this._setState('error');
-      this.emit('exit', exitCode);
-    });
-
-    this.startTime = Date.now();
-    this.requestCount = 0;
-    this._setState('starting');
-
-    console.log(`[bridge] Copilot CLI started (pid=${this.process.pid})`);
-  }
-
-  /**
-   * Handle raw output from the PTY.
-   */
-  _handleOutput(data) {
-    this.buffer += data;
-    this.rawBuffer += data;
-
-    // Reset debounce timer — wait for quiet period
-    if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(
-      () => this._flushBuffer(),
-      config.outputDebounceMs
-    );
-
-    // Transition to streaming if we were idle/starting
-    if (this.state === 'idle' || this.state === 'starting') {
-      this._setState('streaming');
-    }
-  }
-
-  /**
-   * Called when output has been quiet for the debounce period.
-   * Cleans the buffer and emits it as a message.
-   */
-  _flushBuffer() {
-    const raw = this.rawBuffer;
-    this.rawBuffer = '';
-
-    let text = cleanOutput(this.buffer);
-    this.buffer = '';
-
-    // Strip echoed user input if we know what was last sent
-    if (this.lastInput) {
-      text = stripEchoedInput(text, this.lastInput);
-      this.lastInput = null;
-    }
-
-    text = text.trim();
-
-    if (text) {
-      this.emit('output', text, raw);
-    }
-
-    this._setState('idle');
-
-    // Process next queued message
-    this._processNextMessage();
-  }
-
-  /**
-   * Send a text message to the Copilot CLI.
-   * If the CLI is busy, the message is queued.
-   */
-  sendInput(text) {
-    if (!this.process) {
-      this.emit('error', new Error('CLI is not running. Use /reset to restart.'));
-      return false;
-    }
-
-    if (this.state !== 'idle') {
-      this.messageQueue.push(text);
-      this.emit('queued', text, this.messageQueue.length);
-      return false;
-    }
-
-    this._writeInput(text);
-    return true;
-  }
-
-  _writeInput(text) {
-    this.lastInput = text;
-    this.requestCount++;
-    this.process.write(text + '\r');
-    this._setState('streaming');
-  }
-
-  _processNextMessage() {
-    if (this.messageQueue.length === 0) return;
-    const next = this.messageQueue.shift();
-    // Small delay to let the prompt settle
-    setTimeout(() => this._writeInput(next), 300);
-  }
-
-  /**
-   * Send a special key to the PTY (for interactive prompts, menus, etc.).
-   */
-  sendKey(keyName) {
-    if (!this.process) return;
-
-    const keyMap = {
-      enter: '\r',
-      esc: '\x1b',
-      up: '\x1b[A',
-      down: '\x1b[B',
-      left: '\x1b[D',
-      right: '\x1b[C',
-      'ctrl-c': '\x03',
-      'ctrl-d': '\x04',
-      tab: '\t',
-      backspace: '\x7f',
-      y: 'y',
-      n: 'n',
-      space: ' ',
-    };
-
-    const code = keyMap[keyName.toLowerCase()];
-    if (code) {
-      this.process.write(code);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Send Ctrl+C to cancel the current operation.
-   */
-  cancel() {
-    if (!this.process) return;
-    this.process.write('\x03');
-    this.messageQueue = [];
-    this.buffer = '';
-    this.rawBuffer = '';
-    if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    this._setState('idle');
-  }
-
-  /**
-   * Kill and restart the CLI process.
-   */
-  reset() {
-    console.log('[bridge] Resetting CLI...');
-    this.destroy();
-    setTimeout(() => this.start(), 500);
-  }
-
-  /**
-   * Get current bridge status.
-   */
-  getStatus() {
-    const uptime = this.startTime
-      ? Math.round((Date.now() - this.startTime) / 1000)
-      : 0;
-
-    return {
-      state: this.state,
-      pid: this.process?.pid ?? null,
-      queueLength: this.messageQueue.length,
-      bufferSize: this.buffer.length,
-      requestCount: this.requestCount,
-      uptimeSeconds: uptime,
-    };
-  }
-
-  _setState(newState) {
-    const old = this.state;
-    if (old === newState) return;
-    this.state = newState;
-    this.emit('stateChange', newState, old);
-  }
-
-  /**
-   * Clean up all resources.
-   */
-  destroy() {
-    if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    if (this.process) {
-      try {
-        this.process.kill();
-      } catch {
-        // already dead
+      let prompt = text;
+      if (imagePaths.length > 0) {
+        const refs = imagePaths
+          .map(p => `Please analyze the image at: ${p}`)
+          .join('\n');
+        prompt = `${refs}\n\n${text || 'What is in this image?'}`;
       }
-      this.process = null;
+
+      const result = await this._runCopilot(prompt);
+      return result;
+    } finally {
+      this.busy = false;
+      this.emit('busy', false);
+      this._processNext();
     }
-    this.buffer = '';
-    this.rawBuffer = '';
+  }
+
+  _runCopilot(prompt) {
+    return new Promise((resolve, reject) => {
+      const args = [
+        '-p', prompt,
+        '--no-ask-user',
+        '--no-auto-update',
+        '--no-custom-instructions',
+        '--no-color',
+        '--silent',
+        '--allow-all',
+        `--resume=${this.sessionId}`,
+      ];
+
+      if (config.copilot.model) {
+        args.push('--model', config.copilot.model);
+      }
+
+      console.log(`[bridge] Spawning copilot (session=${this.sessionId.slice(0, 8)}...)`);
+
+      const proc = spawn(config.copilot.path, args, {
+        cwd: config.copilot.cwd,
+        windowsHide: true,
+        env: { ...process.env, NO_COLOR: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      // Close stdin immediately — prompt is passed via -p flag
+      proc.stdin.end();
+
+      this.currentProcess = proc;
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+
+      proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      proc.stderr.on('data', (chunk) => {
+        const s = chunk.toString();
+        stderr += s;
+        if (s.trim()) console.log(`[copilot:stderr] ${s.trim()}`);
+      });
+
+      const timeoutMs = config.copilot.timeoutSeconds * 1000;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.warn(`[bridge] Copilot timed out after ${config.copilot.timeoutSeconds}s`);
+        try { proc.kill('SIGTERM'); } catch {}
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+        reject(new Error(`Copilot timed out after ${config.copilot.timeoutSeconds}s`));
+      }, timeoutMs);
+
+      proc.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.currentProcess = null;
+
+        const response = cleanOutput(stdout);
+        console.log(`[bridge] Copilot exited (code=${code}, stdout=${response.length} chars)`);
+
+        if (response) {
+          resolve({ text: response, exitCode: code });
+        } else if (code !== 0) {
+          const errMsg = stderr.trim() || `Process exited with code ${code}`;
+          reject(new Error(errMsg));
+        } else {
+          resolve({ text: '(empty response)', exitCode: 0 });
+        }
+      });
+
+      proc.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.currentProcess = null;
+        reject(err);
+      });
+    });
+  }
+
+  _processNext() {
+    if (this.messageQueue.length === 0) return;
+    const { text, imagePaths, resolve, reject } = this.messageQueue.shift();
+    this._executeMessage(text, imagePaths).then(resolve).catch(reject);
+  }
+
+  /** Cancel the running copilot process and clear the queue. */
+  cancel() {
+    if (this.currentProcess) {
+      try { this.currentProcess.kill('SIGTERM'); } catch {}
+    }
+    // Reject all queued messages
+    for (const item of this.messageQueue) {
+      item.reject(new Error('Cancelled'));
+    }
     this.messageQueue = [];
-    this.lastInput = null;
-    this._setState('stopped');
+  }
+
+  getStatus() {
+    return {
+      state: this.busy ? 'busy' : 'idle',
+      sessionId: this.sessionId,
+      queueLength: this.messageQueue.length,
+      requestCount: this.requestCount,
+      uptimeSeconds: Math.round((Date.now() - this.startTime) / 1000),
+    };
+  }
+
+  /** Verify the copilot CLI is installed and reachable. */
+  async verifyCliAvailable() {
+    return new Promise((resolve) => {
+      const proc = spawn(config.copilot.path, ['--version'], {
+        windowsHide: true,
+        timeout: 15000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      proc.stdout.on('data', (d) => { output += d.toString(); });
+      proc.on('close', (code) => resolve(code === 0 ? output.trim() : null));
+      proc.on('error', () => resolve(null));
+    });
+  }
+
+  /** Ensure the temp directory for image downloads exists. */
+  ensureTempDir() {
+    if (!existsSync(config.tempDir)) {
+      mkdirSync(config.tempDir, { recursive: true });
+    }
+  }
+
+  destroy() {
+    this.cancel();
   }
 }

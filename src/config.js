@@ -1,5 +1,9 @@
 import 'dotenv/config';
-import { existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const projectRoot = join(__dirname, '..');
 
 function required(key) {
   const val = process.env[key];
@@ -15,11 +19,6 @@ function optional(key, fallback) {
   return process.env[key] || fallback;
 }
 
-const copilotPath = optional(
-  'COPILOT_PATH',
-  'copilot'
-);
-
 export const config = {
   telegram: {
     botToken: required('TELEGRAM_BOT_TOKEN'),
@@ -27,12 +26,11 @@ export const config = {
     chatId: Number(required('TELEGRAM_CHAT_ID')),
   },
   copilot: {
-    path: copilotPath,
+    path: optional('COPILOT_PATH', 'copilot'),
     cwd: optional('COPILOT_CWD', process.cwd()),
+    model: process.env.COPILOT_MODEL || null,
+    timeoutSeconds: Number(optional('COPILOT_TIMEOUT_SECONDS', '90')),
   },
-  pty: {
-    cols: Number(optional('PTY_COLS', '120')),
-    rows: Number(optional('PTY_ROWS', '40')),
-  },
-  outputDebounceMs: Number(optional('OUTPUT_DEBOUNCE_MS', '1500')),
+  stateFile: join(projectRoot, 'session-state.json'),
+  tempDir: join(projectRoot, 'temp'),
 };
