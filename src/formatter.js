@@ -1,8 +1,7 @@
 const TELEGRAM_MAX_LENGTH = 4096;
 
-/**
- * Escape text for Telegram HTML parse mode.
- */
+// ─── Telegram HTML escaping ─────────────────────────────────────────
+
 export function escapeHtml(text) {
   return text
     .replace(/&/g, '&amp;')
@@ -10,31 +9,107 @@ export function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
+// ─── CLI-style formatted messages ───────────────────────────────────
+
 /**
- * Format assistant output for Telegram with purple-style marker.
+ * Format an assistant response in GitHub Copilot CLI style.
+ * Uses 🟣 (magenta) header, properly formatted code blocks, and clean layout.
  */
 export function formatAssistant(text) {
   const clean = text.trim();
   if (!clean) return null;
-  return `🟣 <b>Copilot</b>\n<pre>${escapeHtml(clean)}</pre>`;
+
+  // Convert markdown to Telegram HTML
+  const html = markdownToHtml(clean);
+  return `🟣 <b>Copilot</b>\n\n${html}`;
 }
 
 /**
- * Format a system/status message (bridge notifications).
+ * Format a tool activity line (magenta-style, like CLI spinner lines).
+ */
+export function formatToolActivity(toolName) {
+  return `⚙️ <i>${escapeHtml(toolName)}</i>`;
+}
+
+/**
+ * Format a system/status message.
  */
 export function formatSystem(text) {
   return `🔵 <i>${escapeHtml(text)}</i>`;
 }
 
 /**
- * Format the user's own message echo (confirmation of what was sent).
+ * Format a "thinking" indicator.
  */
-export function formatUserEcho(text) {
-  return `🟢 <b>You:</b> <code>${escapeHtml(text)}</code>`;
+export function formatThinking() {
+  return '⏳ <i>Working…</i>';
 }
 
 /**
- * Split a long message into Telegram-safe chunks.
+ * Format a success/completion message.
+ */
+export function formatSuccess(text) {
+  return `✅ <i>${escapeHtml(text)}</i>`;
+}
+
+// ─── Markdown → Telegram HTML conversion ────────────────────────────
+
+/**
+ * Convert assistant markdown to Telegram-safe HTML.
+ * Handles: code blocks, inline code, bold, italic, headers, links, lists.
+ */
+function markdownToHtml(text) {
+  // Stash code blocks first (protect from further processing)
+  const stash = [];
+  const stashToken = (s) => { stash.push(s); return `\x00S${stash.length - 1}\x00`; };
+
+  let out = text;
+
+  // Fenced code blocks → <pre><code>
+  out = out.replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
+    const langAttr = lang ? ` class="language-${lang}"` : '';
+    return stashToken(`<pre><code${langAttr}>${escapeHtml(code.trimEnd())}</code></pre>`);
+  });
+
+  // Inline code → <code>
+  out = out.replace(/`([^`\n]+)`/g, (_m, code) => {
+    return stashToken(`<code>${escapeHtml(code)}</code>`);
+  });
+
+  // Now escape the remaining text
+  out = escapeHtml(out);
+
+  // Headers → bold
+  out = out.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
+
+  // Bold **text** or __text__
+  out = out.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  out = out.replace(/__(.+?)__/g, '<b>$1</b>');
+
+  // Italic *text* or _text_
+  out = out.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
+  out = out.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
+
+  // Links [text](url) → text (url)
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Horizontal rules
+  out = out.replace(/^[-*_]{3,}\s*$/gm, '');
+
+  // Restore stashed blocks
+  out = out.replace(/\x00S(\d+)\x00/g, (_m, i) => stash[+i]);
+
+  // Clean excessive blank lines
+  out = out.replace(/\n{3,}/g, '\n\n');
+
+  return out.trim();
+}
+
+// ─── Message chunking ───────────────────────────────────────────────
+
+/**
+ * Split a long message into Telegram-safe chunks (≤4096 chars).
+ * Respects code block boundaries.
  */
 export function chunkMessage(text) {
   if (text.length <= TELEGRAM_MAX_LENGTH) return [text];
@@ -48,21 +123,41 @@ export function chunkMessage(text) {
       break;
     }
 
-    let splitAt = remaining.lastIndexOf('\n', TELEGRAM_MAX_LENGTH);
-    if (splitAt <= 0) splitAt = TELEGRAM_MAX_LENGTH;
+    const window = remaining.slice(0, TELEGRAM_MAX_LENGTH);
 
-    chunks.push(remaining.slice(0, splitAt));
+    // Check if we're inside a code block at the split point
+    const preOpens = (window.match(/<pre>/gi) || []).length;
+    const preCloses = (window.match(/<\/pre>/gi) || []).length;
+    const insideCode = preOpens > preCloses;
+
+    let splitAt;
+    if (insideCode) {
+      // Find last newline to split cleanly inside code
+      splitAt = window.lastIndexOf('\n');
+      if (splitAt < TELEGRAM_MAX_LENGTH * 0.2) {
+        splitAt = TELEGRAM_MAX_LENGTH - 20;
+      }
+    } else {
+      // Prefer paragraph breaks, then newlines
+      splitAt = window.lastIndexOf('\n\n');
+      if (splitAt < TELEGRAM_MAX_LENGTH * 0.3) {
+        splitAt = window.lastIndexOf('\n');
+      }
+      if (splitAt < TELEGRAM_MAX_LENGTH * 0.3) {
+        splitAt = TELEGRAM_MAX_LENGTH;
+      }
+    }
+
+    let chunk = remaining.slice(0, splitAt);
     remaining = remaining.slice(splitAt).replace(/^\n/, '');
+
+    if (insideCode) {
+      chunk += '</code></pre>';
+      remaining = '<pre><code>' + remaining;
+    }
+
+    chunks.push(chunk);
   }
 
   return chunks;
-}
-
-/**
- * Normalize output: collapse blank lines, trim.
- */
-export function cleanOutput(raw) {
-  let text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  text = text.replace(/\n{3,}/g, '\n\n');
-  return text.trim();
 }

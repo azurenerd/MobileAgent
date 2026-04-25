@@ -1,19 +1,19 @@
-# Copilot Telegram Bridge v2
+# Copilot Telegram Bridge v3
 
-Chat with GitHub Copilot CLI from your phone via Telegram. Runs on your Windows PC and bridges messages between a Telegram bot and the Copilot CLI using **pipe mode** — no PTY, no duplicate messages.
+Chat with GitHub Copilot CLI from your phone via Telegram. Runs on your Windows PC and bridges messages between a Telegram bot and the Copilot CLI using the **@github/copilot-sdk** — full tool execution, session switching, and permission modes.
 
 ```
-iPhone (Telegram) ←→ Telegram API ←→ This bridge (your PC) ←→ copilot.exe -p
+iPhone (Telegram) ←→ Telegram API ←→ This bridge (your PC) ←→ Copilot SDK ←→ copilot.exe
 ```
 
 ## How It Works
 
 1. The bridge runs a Telegram bot that listens for your messages
-2. When you send a message, it spawns `copilot -p "<your message>" --resume=<sessionId>` 
-3. Copilot processes the prompt and returns a single clean response via stdout
-4. Process exit = response complete (no debounce/timing issues)
-5. Session persists across messages via `--resume` (Copilot remembers the conversation)
-6. Messages are **queued** if the CLI is busy — one at a time, in order
+2. Messages are sent to Copilot via the `@github/copilot-sdk` (JSON-RPC)
+3. Copilot processes the prompt with streaming — tool activity shows live in Telegram
+4. Session persists across messages and bridge restarts
+5. Switch between active terminal CLI sessions from your phone
+6. Control permissions with `/agent`, `/ask`, `/plan` modes
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ iPhone (Telegram) ←→ Telegram API ←→ This bridge (your PC) ←→ copilo
 
 ### 2. Authenticate Copilot CLI
 
-**Important:** Run `copilot` once manually in a terminal and complete the GitHub OAuth login. The bridge cannot handle the browser-based auth flow.
+Run `copilot` once manually in a terminal and complete the GitHub OAuth login:
 
 ```powershell
 copilot
@@ -41,13 +41,14 @@ cd copilot-telegram-bridge
 copy .env.example .env
 ```
 
-Edit `.env` and fill in your credentials:
+Edit `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_USER_ID=your_numeric_id
 TELEGRAM_CHAT_ID=your_numeric_chat_id
-COPILOT_PATH=C:\path\to\copilot.exe
+COPILOT_MODEL=claude-sonnet-4
+COPILOT_TIMEOUT_SECONDS=600
 ```
 
 ### 4. Install & Run
@@ -57,65 +58,95 @@ npm install
 npm start
 ```
 
-You'll see a startup banner and receive a confirmation message in Telegram.
-
 ## Telegram Commands
+
+### Permission Modes
+
+| Command | Mode | Description |
+|---------|------|-------------|
+| `/agent` | 🤖 Agent | Full autonomy — executes commands, reads/writes files |
+| `/ask` | 💬 Ask | Read-only — answers questions, can read files for context |
+| `/plan` | 📋 Plan | Suggest-only — describes what it would do, no execution |
+
+### Session Management
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Bridge state, session ID, uptime, queue |
-| `/cancel` | Cancel current Copilot request, clear queue |
-| `/newsession` | Start a new conversation (fresh context) |
-| `/session` | Show current session ID |
-| `/queue` | Show queued messages |
+| `/sessions` | List active Copilot CLI sessions from your terminal windows |
+| `/switch <n>` | Switch to session N (connect to a terminal session) |
+| `/new` | Start a fresh conversation (new session) |
+
+### General
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Bridge state, mode, session ID, uptime |
+| `/cancel` | Cancel current request, clear queue |
+| `/model` | Show or change the AI model |
+| `/models` | List all available models |
 | `/help` | Show all commands |
 
 ## Features
 
-- **📱 Text messages** — Type anything to chat with Copilot
-- **📷 Photo support** — Send a photo and Copilot will try to analyze it
-- **⏳ Thinking indicator** — Shows "Thinking..." while Copilot processes
-- **🔄 Session persistence** — Conversation memory persists across messages
-- **📋 Message queue** — Messages queued when Copilot is busy
-- **🟣 Purple-style formatting** — Copilot responses with purple emoji marker
+- **🤖 Permission Modes** — `/agent` for full tool execution, `/ask` for read-only, `/plan` for suggestions
+- **🔀 Session Switching** — Connect to any active Copilot CLI terminal session from your phone
+- **📱 Text Messages** — Type anything to chat with Copilot
+- **📷 Photo Support** — Send a photo for image analysis
+- **⏳ Live Progress** — Shows tool activity and elapsed time during long operations
+- **🔄 Session Persistence** — Conversation memory survives bridge restarts
+- **📋 Message Queue** — Messages queued when Copilot is busy
+- **⏱️ Graceful Timeouts** — Returns partial results if timeout is reached (no lost work)
+- **🟣 CLI-Style Formatting** — Purple Copilot header with HTML-formatted responses
 
-## Message Format
+## Architecture (v3)
 
-- 🟣 **Purple circle** = Copilot's response (monospace code block)
-- 🔵 **Blue circle** = System/bridge notifications
+```
+┌────────────┐     ┌──────────────┐     ┌──────────────────┐
+│   iPhone    │────▶│  Telegram    │────▶│   Node.js Bridge  │
+│  (Telegram) │◀────│    API       │◀────│   (your PC)       │
+└────────────┘     └──────────────┘     └────────┬─────────┘
+                                                  │
+                                         @github/copilot-sdk
+                                          (JSON-RPC over stdio)
+                                                  │
+                                         ┌────────▼─────────┐
+                                         │   copilot.exe     │
+                                         │  (CLI subprocess) │
+                                         └──────────────────┘
+```
+
+**Key Components:**
+- `src/index.js` — Entry point, custom Telegram polling loop (handles 409 conflicts)
+- `src/bridge.js` — Copilot SDK integration, session management, permission modes
+- `src/telegram.js` — Telegram bot commands and message handling
+- `src/sessions.js` — Discovers active CLI sessions (process scan + SQLite)
+- `src/formatter.js` — CLI-style message formatting for Telegram
+- `src/config.js` — Environment config with auto-detection of copilot.exe
 
 ## Configuration (.env)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from BotFather |
-| `TELEGRAM_USER_ID` | ✅ | — | Your Telegram user ID |
+| `TELEGRAM_USER_ID` | ✅ | — | Your Telegram user ID (auth filter) |
 | `TELEGRAM_CHAT_ID` | ✅ | — | Chat ID for the bot conversation |
-| `COPILOT_PATH` | ❌ | `copilot` | Full path to copilot.exe |
-| `COPILOT_CWD` | ❌ | Current dir | Working directory for CLI |
-| `COPILOT_TIMEOUT_SECONDS` | ❌ | `90` | Max seconds per Copilot request |
-| `COPILOT_MODEL` | ❌ | (default) | Override model (e.g., `claude-sonnet-4`) |
-
-## Tips
-
-- **Long responses**: Automatically chunked into multiple Telegram messages (4096 char limit)
-- **New conversation**: Use `/newsession` to reset context
-- **Stuck?**: Try `/cancel` then resend your message
-- **Run at startup**: Use Task Scheduler to run `npm start` on login
-- **Model selection**: Set `COPILOT_MODEL` in `.env` to use a specific model
+| `COPILOT_MODEL` | ❌ | `claude-sonnet-4` | AI model to use |
+| `COPILOT_TIMEOUT_SECONDS` | ❌ | `600` | Max seconds per request (10 min) |
+| `COPILOT_CLI_PATH` | ❌ | Auto-detect | Path to copilot.exe |
 
 ## Security
 
-- Only messages from your configured `TELEGRAM_USER_ID` + `TELEGRAM_CHAT_ID` are accepted
+- Only messages from your configured `TELEGRAM_USER_ID` are accepted
 - All other messages are silently dropped
-- Bot token and chat ID are in `.env` (gitignored)
+- Bot token and credentials are in `.env` (gitignored)
+- Recommended: Set your bot to private mode via BotFather (`/setjoingroups` → Disable)
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| "Invalid bot token" | Double-check `TELEGRAM_BOT_TOKEN` in `.env` |
-| 409 Conflict | Another bot instance is polling — stop it first, or wait for the retry loop |
-| No messages received | Verify `TELEGRAM_CHAT_ID` via `/getUpdates` |
+| 409 Conflict | Another bot instance is polling — stop it first (auto-retries with backoff) |
+| Permission restrictions | Use `/agent` to switch to full autonomy mode |
+| Timeout errors | Timeout is 10 min; partial results returned on timeout |
 | CLI auth fails | Run `copilot` manually first to complete OAuth login |
-| Timeout errors | Increase `COPILOT_TIMEOUT_SECONDS` or simplify your prompt |
+| Session not found | Use `/sessions` to list active sessions, `/new` for fresh one |

@@ -1,116 +1,175 @@
-import { Telegraf } from 'telegraf';
+import { Bot } from 'grammy';
 import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import https from 'https';
 import http from 'http';
 import { config } from './config.js';
+import { formatRelativeTime } from './sessions.js';
+import { MODE_LABELS } from './bridge.js';
 import {
   formatAssistant,
+  formatToolActivity,
   formatSystem,
+  formatThinking,
   chunkMessage,
   escapeHtml,
 } from './formatter.js';
 
 /**
- * Set up the Telegram bot and wire it to the CopilotBridge (v2 pipe mode).
+ * Create and configure the Telegram bot with grammY.
+ * Wires message handlers to the CopilotBridge.
  */
 export function createTelegramBot(bridge) {
-  const bot = new Telegraf(config.telegram.botToken);
+  const bot = new Bot(config.telegram.botToken);
 
-  // ─── Security middleware: reject unauthorized senders ────────────
-  bot.use((ctx, next) => {
-    const fromId = ctx.from?.id;
-    const chatId = ctx.chat?.id;
-    if (fromId !== config.telegram.userId || chatId !== config.telegram.chatId) {
-      console.log(`[telegram] Rejected message from user=${fromId} chat=${chatId}`);
-      return;
+  // ─── Auth middleware: only allow the authorized user ─────────────
+  bot.use(async (ctx, next) => {
+    if (ctx.from?.id !== config.telegram.userId) {
+      return; // silently reject
     }
-    return next();
+    await next();
   });
 
-  // ─── Helper: send a message to the configured chat ──────────────
-  async function sendToChat(text, parseMode = 'HTML') {
+  // ─── Helper: send HTML message with chunking ────────────────────
+  async function sendHtml(chatId, text) {
     const chunks = chunkMessage(text);
     for (const chunk of chunks) {
       try {
-        await bot.telegram.sendMessage(config.telegram.chatId, chunk, {
-          parse_mode: parseMode,
-          disable_web_page_preview: true,
+        await bot.api.sendMessage(chatId, chunk, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
         });
       } catch (err) {
-        if (parseMode === 'HTML') {
-          console.warn('[telegram] HTML send failed, retrying plain:', err.message);
-          try {
-            await bot.telegram.sendMessage(config.telegram.chatId, chunk);
-          } catch (err2) {
-            console.error('[telegram] Plain send also failed:', err2.message);
-          }
-        } else {
-          console.error('[telegram] Send failed:', err.message);
+        // Fallback: send as plain text
+        console.warn('[telegram] HTML send failed, trying plain:', err.message);
+        try {
+          await bot.api.sendMessage(chatId, chunk);
+        } catch (err2) {
+          console.error('[telegram] Plain send also failed:', err2.message);
         }
       }
     }
   }
 
-  // ─── Helper: send thinking indicator, return message for editing ─
-  async function sendThinking(ctx) {
+  // ─── Helper: edit a message with HTML, fallback to new message ──
+  async function editMessage(chatId, messageId, text) {
+    const chunks = chunkMessage(text);
     try {
-      const msg = await ctx.reply('⏳ Thinking...', { parse_mode: 'HTML' });
-      return msg.message_id;
-    } catch {
-      return null;
-    }
-  }
-
-  async function editOrSend(ctx, thinkingMsgId, text, parseMode = 'HTML') {
-    if (thinkingMsgId) {
-      try {
-        const chunks = chunkMessage(text);
-        // Edit the thinking message with the first chunk
-        await bot.telegram.editMessageText(
-          config.telegram.chatId,
-          thinkingMsgId,
-          undefined,
-          chunks[0],
-          { parse_mode: parseMode, disable_web_page_preview: true }
-        );
-        // Send remaining chunks as new messages
-        for (let i = 1; i < chunks.length; i++) {
-          await bot.telegram.sendMessage(config.telegram.chatId, chunks[i], {
-            parse_mode: parseMode,
-            disable_web_page_preview: true,
-          });
-        }
-        return;
-      } catch (err) {
-        console.warn('[telegram] Failed to edit thinking msg:', err.message);
+      await bot.api.editMessageText(chatId, messageId, chunks[0], {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+      // Send overflow chunks as new messages
+      for (let i = 1; i < chunks.length; i++) {
+        await bot.api.sendMessage(chatId, chunks[i], {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
       }
+    } catch (err) {
+      // If edit fails (e.g. message too old), send as new
+      console.warn('[telegram] Edit failed, sending new:', err.message);
+      await sendHtml(chatId, text);
     }
-    await sendToChat(text, parseMode);
   }
 
-  // ─── Helper: process a message through copilot ──────────────────
+  // ─── Helper: typing indicator loop ──────────────────────────────
+  function startTyping(chatId) {
+    const send = () => bot.api.sendChatAction(chatId, 'typing').catch(() => {});
+    send();
+    const interval = setInterval(send, 4000);
+    return () => clearInterval(interval);
+  }
+
+  // ─── Core: process a user message through Copilot ───────────────
   async function handleUserMessage(ctx, text, imagePaths = []) {
-    const thinkingMsgId = await sendThinking(ctx);
+    const chatId = ctx.chat.id;
+    const userMsgId = ctx.message.message_id;
+    const startTime = Date.now();
+
+    // Send thinking indicator
+    let statusMsg;
+    try {
+      statusMsg = await ctx.reply(formatThinking(), {
+        parse_mode: 'HTML',
+      });
+    } catch {
+      statusMsg = null;
+    }
+
+    const stopTyping = startTyping(chatId);
+
+    // Track tool activity for live updates
+    let lastToolUpdate = 0;
+    let toolsUsed = [];
+    const onToolStart = async (toolName) => {
+      toolsUsed.push(toolName);
+      const now = Date.now();
+      if (statusMsg && now - lastToolUpdate > 2000) {
+        lastToolUpdate = now;
+        try {
+          await bot.api.editMessageText(
+            chatId, statusMsg.message_id,
+            formatToolActivity(toolName),
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
+      }
+    };
+
+    // Periodic progress updates every 30s during long operations
+    let progressInterval = null;
+    if (statusMsg) {
+      progressInterval = setInterval(async () => {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        const toolInfo = toolsUsed.length > 0
+          ? `\nTools: ${toolsUsed.slice(-3).join(', ')}${toolsUsed.length > 3 ? ` (+${toolsUsed.length - 3} more)` : ''}`
+          : '';
+        try {
+          await bot.api.editMessageText(
+            chatId, statusMsg.message_id,
+            `🔄 <i>Working… (${elapsed}s elapsed)${toolInfo}</i>`,
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
+      }, 30000);
+    }
+
+    bridge.on('tool_start', onToolStart);
 
     try {
       const result = await bridge.sendMessage(text, imagePaths);
+      stopTyping();
+      bridge.off('tool_start', onToolStart);
+      if (progressInterval) clearInterval(progressInterval);
+
+      // Format the response in CLI style
       const formatted = formatAssistant(result.text);
-      if (formatted) {
-        await editOrSend(ctx, thinkingMsgId, formatted);
-      } else {
-        await editOrSend(ctx, thinkingMsgId, formatSystem('(empty response)'));
+      if (formatted && statusMsg) {
+        await editMessage(chatId, statusMsg.message_id, formatted);
+      } else if (formatted) {
+        await sendHtml(chatId, formatted);
+      } else if (statusMsg) {
+        await editMessage(chatId, statusMsg.message_id, formatSystem('(empty response)'));
       }
     } catch (err) {
-      const errMsg = formatSystem(`❌ Error: ${err.message}`);
-      await editOrSend(ctx, thinkingMsgId, errMsg);
+      stopTyping();
+      bridge.off('tool_start', onToolStart);
+      if (progressInterval) clearInterval(progressInterval);
+
+      const errText = formatSystem(`❌ Error: ${err.message}`);
+      if (statusMsg) {
+        await editMessage(chatId, statusMsg.message_id, errText);
+      } else {
+        await sendHtml(chatId, errText);
+      }
     }
   }
 
-  // ─── Helper: download a Telegram file to local temp dir ─────────
+  // ─── Helper: download Telegram file to local temp dir ───────────
   async function downloadTelegramFile(fileId) {
     bridge.ensureTempDir();
-    const file = await bot.telegram.getFile(fileId);
+    const file = await bot.api.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${config.telegram.botToken}/${file.file_path}`;
     const ext = file.file_path.split('.').pop() || 'jpg';
     const localPath = join(config.tempDir, `${fileId}.${ext}`);
@@ -133,122 +192,290 @@ export function createTelegramBot(bridge) {
 
   // ─── Bot commands ───────────────────────────────────────────────
 
-  bot.command('start', async (ctx) => {
-    await ctx.reply(
-      `🤖 <b>Copilot Telegram Bridge v2</b>\n\n` +
-        `Send any message to chat with Copilot CLI.\n` +
-        `You can also send photos for image analysis!\n\n` +
-        `<b>Commands:</b>\n` +
-        `  /status      — Bridge &amp; session status\n` +
-        `  /cancel      — Cancel current request\n` +
-        `  /newsession  — Start a new conversation\n` +
-        `  /session     — Show current session ID\n` +
-        `  /help        — Show this help\n`,
-      { parse_mode: 'HTML' }
-    );
-  });
+  bot.command('start', (ctx) => ctx.reply(
+    `🟣 <b>Copilot Mobile Assistant v3</b>\n\n` +
+    `Powered by the GitHub Copilot SDK.\n` +
+    `Send any message to chat with Copilot.\n\n` +
+    `<b>Modes:</b>\n` +
+    `  /agent — Full autonomy (execute tools)\n` +
+    `  /ask — Read-only (answers only)\n` +
+    `  /plan — Suggest-only (no execution)\n\n` +
+    `<b>Commands:</b>\n` +
+    `  /sessions — List active CLI sessions\n` +
+    `  /switch &lt;n&gt; — Switch to session N\n` +
+    `  /status — Bridge &amp; session info\n` +
+    `  /new — Start a new conversation\n` +
+    `  /help — Show this help`,
+    { parse_mode: 'HTML' }
+  ));
 
-  bot.command('help', async (ctx) => {
-    await ctx.reply(
-      `<b>Commands:</b>\n` +
-        `  /status      — Bridge &amp; session info\n` +
-        `  /cancel      — Cancel running request\n` +
-        `  /newsession  — Start fresh conversation\n` +
-        `  /session     — Current session ID\n` +
-        `  /queue       — Show queued messages\n\n` +
-        `<b>Tips:</b>\n` +
-        `  • Just type to chat with Copilot\n` +
-        `  • Send a photo and Copilot will analyze it\n` +
-        `  • Add a caption to a photo for specific questions\n` +
-        `  • Session persists across messages (conversation memory)\n`,
-      { parse_mode: 'HTML' }
-    );
-  });
+  bot.command('help', (ctx) => ctx.reply(
+    `<b>Modes:</b>\n` +
+    `  /agent — 🤖 Full autonomy (run commands, write files)\n` +
+    `  /ask — 💬 Read-only (answer questions)\n` +
+    `  /plan — 📋 Suggest-only (describe, don't execute)\n\n` +
+    `<b>Sessions:</b>\n` +
+    `  /sessions — List active CLI terminal sessions\n` +
+    `  /switch &lt;n&gt; — Connect to session N\n` +
+    `  /new — Fresh conversation\n\n` +
+    `<b>Other:</b>\n` +
+    `  /status — Session info, mode &amp; uptime\n` +
+    `  /cancel — Cancel current request\n` +
+    `  /model — Current model\n` +
+    `  /model &lt;name&gt; — Switch model\n\n` +
+    `<b>Tips:</b>\n` +
+    `  • Send a photo for image analysis\n` +
+    `  • /sessions to see your open terminals\n` +
+    `  • /agent before asking it to do work`,
+    { parse_mode: 'HTML' }
+  ));
 
   bot.command('status', async (ctx) => {
     const s = bridge.getStatus();
     const emoji = s.state === 'idle' ? '🟢' : '⏳';
     await ctx.reply(
       `${emoji} <b>Bridge Status</b>\n\n` +
-        `State: <code>${s.state}</code>\n` +
-        `Session: <code>${s.sessionId.slice(0, 8)}...</code>\n` +
-        `Queue: <code>${s.queueLength}</code>\n` +
-        `Requests: <code>${s.requestCount}</code>\n` +
-        `Uptime: <code>${formatUptime(s.uptimeSeconds)}</code>`,
+      `State: <code>${s.state}</code>\n` +
+      `Mode: ${s.modeLabel}\n` +
+      `Session: <code>${s.sessionId ? s.sessionId.slice(0, 8) + '…' : 'none'}</code>\n` +
+      `Model: <code>${s.model}</code>\n` +
+      `Queue: <code>${s.queueLength}</code>\n` +
+      `Requests: <code>${s.requestCount}</code>\n` +
+      `Uptime: <code>${formatUptime(s.uptimeSeconds)}</code>`,
       { parse_mode: 'HTML' }
     );
   });
 
   bot.command('cancel', async (ctx) => {
-    bridge.cancel();
-    await ctx.reply(formatSystem('Cancelled current request. Queue cleared.'), { parse_mode: 'HTML' });
+    await bridge.cancel();
+    await ctx.reply(formatSystem('Cancelled. Queue cleared.'), { parse_mode: 'HTML' });
   });
 
-  bot.command('newsession', async (ctx) => {
-    const newId = bridge.newSession();
-    await ctx.reply(
-      formatSystem(`New session started: ${newId.slice(0, 8)}...\nConversation memory has been reset.`),
-      { parse_mode: 'HTML' }
-    );
-  });
-
-  bot.command('session', async (ctx) => {
-    await ctx.reply(
-      formatSystem(`Session ID: ${bridge.getSessionId()}`),
-      { parse_mode: 'HTML' }
-    );
-  });
-
-  bot.command('queue', async (ctx) => {
-    const s = bridge.getStatus();
-    if (s.queueLength === 0) {
-      await ctx.reply(formatSystem('Queue is empty.'), { parse_mode: 'HTML' });
-    } else {
+  bot.command('new', async (ctx) => {
+    try {
+      const newId = await bridge.newSession();
       await ctx.reply(
-        formatSystem(`${s.queueLength} message(s) queued. Use /cancel to clear.`),
+        formatSystem(`New session: ${newId.slice(0, 8)}…\nConversation memory reset.`),
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      await ctx.reply(
+        formatSystem(`❌ Failed to create session: ${err.message}`),
         { parse_mode: 'HTML' }
       );
     }
   });
 
-  // ─── Photo messages → download + send to Copilot ────────────────
-
-  bot.on('photo', async (ctx) => {
-    const photos = ctx.message.photo;
-    // Telegram sends multiple sizes; take the largest
-    const largest = photos[photos.length - 1];
-    const caption = ctx.message.caption || '';
-
-    try {
-      const localPath = await downloadTelegramFile(largest.file_id);
-      console.log(`[telegram] Downloaded photo to: ${localPath}`);
-
-      await handleUserMessage(ctx, caption, [localPath]);
-
-      // Clean up temp file
-      try { unlinkSync(localPath); } catch {}
-    } catch (err) {
-      console.error('[telegram] Photo handling error:', err);
-      await ctx.reply(formatSystem(`❌ Failed to process photo: ${err.message}`), { parse_mode: 'HTML' });
+  bot.command('model', async (ctx) => {
+    const arg = ctx.match?.trim();
+    if (arg) {
+      config.copilot.model = arg;
+      await ctx.reply(formatSystem(`Model switched to: ${arg}`), { parse_mode: 'HTML' });
+    } else {
+      await ctx.reply(
+        formatSystem(`Current model: ${config.copilot.model}`),
+        { parse_mode: 'HTML' }
+      );
     }
   });
 
-  // ─── Regular text messages → send to Copilot ───────────────────
+  bot.command('models', async (ctx) => {
+    try {
+      const models = await bridge.listModels();
+      if (models.length === 0) {
+        await ctx.reply(formatSystem('No models available.'), { parse_mode: 'HTML' });
+        return;
+      }
+      const lines = models.map(m =>
+        m.id === config.copilot.model ? `• <b>${escapeHtml(m.id)}</b> ← current` : `• ${escapeHtml(m.id)}`
+      );
+      await sendHtml(ctx.chat.id, lines.join('\n'));
+    } catch (err) {
+      await ctx.reply(formatSystem(`Failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
 
-  bot.on('text', async (ctx) => {
+  // ─── Permission mode commands ───────────────────────────────────
+
+  bot.command('agent', async (ctx) => {
+    try {
+      await bridge.setMode('agent');
+      const s = bridge.getStatus();
+      await ctx.reply(
+        `🤖 <b>Agent Mode</b>\n\n` +
+        `Full autonomy enabled. Copilot can:\n` +
+        `• Execute shell commands\n` +
+        `• Read and write files\n` +
+        `• Run tools automatically\n\n` +
+        `New session: <code>${s.sessionId?.slice(0, 8) || '?'}…</code>\n` +
+        `All permissions granted (autopilot).`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      await ctx.reply(formatSystem(`❌ Mode switch failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.command('ask', async (ctx) => {
+    try {
+      await bridge.setMode('ask');
+      await ctx.reply(
+        `💬 <b>Ask Mode</b>\n\n` +
+        `Read-only mode. Copilot can:\n` +
+        `• Read files for context\n` +
+        `• Answer questions\n` +
+        `• ❌ Cannot execute commands or write files\n\n` +
+        `Session reconnected with ask permissions.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      await ctx.reply(formatSystem(`❌ Mode switch failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.command('plan', async (ctx) => {
+    try {
+      await bridge.setMode('plan');
+      await ctx.reply(
+        `📋 <b>Plan Mode</b>\n\n` +
+        `Suggest-only mode. Copilot will:\n` +
+        `• Describe what it would do\n` +
+        `• Suggest commands and changes\n` +
+        `• ❌ Cannot execute any tools\n\n` +
+        `Switch to /agent to execute plans.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      await ctx.reply(formatSystem(`❌ Mode switch failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  // ─── Session discovery + switching ──────────────────────────────
+
+  // Store last session list for /switch reference
+  let lastSessionList = [];
+
+  bot.command('sessions', async (ctx) => {
+    try {
+      const sessions = bridge.listActiveSessions();
+      lastSessionList = sessions;
+
+      if (sessions.length === 0) {
+        await ctx.reply(
+          formatSystem('No active Copilot CLI sessions found.\nOpen a terminal and start a Copilot session first.'),
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const currentId = bridge.getStatus().sessionId;
+      const lines = ['🔍 <b>Active Copilot Sessions:</b>\n'];
+
+      sessions.forEach((s, i) => {
+        const num = `${i + 1}️⃣`;
+        const isCurrent = s.sessionId === currentId;
+        const marker = isCurrent ? ' ✅ <i>connected</i>' : '';
+        const name = s.projectName || s.sessionId.slice(0, 8);
+        const path = s.projectPath ? `\n     📁 <code>${escapeHtml(s.projectPath)}</code>` : '';
+        const summary = s.summary ? `\n     💬 <i>${escapeHtml(s.summary.slice(0, 60))}</i>` : '';
+        const time = s.lastActive ? `\n     🕐 ${formatRelativeTime(s.lastActive)}` : '';
+
+        lines.push(`${num} <b>${escapeHtml(name)}</b>${marker}${path}${summary}${time}\n`);
+      });
+
+      lines.push('Reply <code>/switch N</code> to connect to a session.');
+      await sendHtml(ctx.chat.id, lines.join('\n'));
+    } catch (err) {
+      console.error('[telegram] /sessions error:', err);
+      await ctx.reply(formatSystem(`❌ Failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.command('switch', async (ctx) => {
+    const arg = ctx.match?.trim();
+    const num = parseInt(arg, 10);
+
+    if (!arg || isNaN(num)) {
+      await ctx.reply(
+        formatSystem('Usage: /switch <number>\nRun /sessions first to see the list.'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (lastSessionList.length === 0) {
+      await ctx.reply(
+        formatSystem('No session list cached. Run /sessions first.'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (num < 1 || num > lastSessionList.length) {
+      await ctx.reply(
+        formatSystem(`Invalid. Pick 1–${lastSessionList.length}.`),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const target = lastSessionList[num - 1];
+    const displayName = target.projectName || target.sessionId.slice(0, 8);
+
+    try {
+      await ctx.reply(formatThinking(), { parse_mode: 'HTML' });
+      await bridge.switchSession(target.sessionId, target.projectPath);
+      await ctx.reply(
+        `✅ <b>Switched to: ${escapeHtml(displayName)}</b>\n` +
+        (target.projectPath ? `📁 <code>${escapeHtml(target.projectPath)}</code>\n` : '') +
+        `Session: <code>${target.sessionId.slice(0, 8)}…</code>\n\n` +
+        `Send a message to continue working in this session.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      console.error('[telegram] /switch error:', err);
+      await ctx.reply(
+        formatSystem(`❌ Switch failed: ${err.message}`),
+        { parse_mode: 'HTML' }
+      );
+    }
+  });
+
+  // ─── Photo messages → download + analyze ────────────────────────
+
+  bot.on('message:photo', async (ctx) => {
+    const photos = ctx.message.photo;
+    const largest = photos[photos.length - 1];
+    const caption = ctx.message.caption || 'What is in this image?';
+
+    try {
+      const localPath = await downloadTelegramFile(largest.file_id);
+      console.log(`[telegram] Downloaded photo: ${localPath}`);
+      await handleUserMessage(ctx, caption, [localPath]);
+      try { unlinkSync(localPath); } catch {}
+    } catch (err) {
+      console.error('[telegram] Photo error:', err);
+      await ctx.reply(formatSystem(`❌ Photo failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  // ─── Text messages → send to Copilot ────────────────────────────
+
+  bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
-    if (text.startsWith('/')) return; // commands handled above
-
+    if (text.startsWith('/')) return;
     await handleUserMessage(ctx, text);
   });
 
-  // ─── Bridge events for queue notifications ─────────────────────
+  // ─── Bridge events ─────────────────────────────────────────────
 
-  bridge.on('queued', async (text, queueLen) => {
-    await sendToChat(formatSystem(`Message queued (${queueLen} in queue). Waiting for current request...`));
+  bridge.on('queued', async (queueLen) => {
+    await sendHtml(config.telegram.chatId,
+      formatSystem(`Message queued (${queueLen} waiting)…`)
+    );
   });
 
-  return { bot, sendToChat };
+  return { bot, sendHtml };
 }
 
 function formatUptime(seconds) {

@@ -1,83 +1,239 @@
-import { spawn } from 'child_process';
+import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { EventEmitter } from 'events';
-import { randomUUID } from 'crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { config } from './config.js';
-import { cleanOutput } from './formatter.js';
+import { discoverSessions } from './sessions.js';
+
+// ─── Permission handlers per mode ────────────────────────────────────
+
+/** Agent mode: approve everything automatically. */
+const agentPermissionHandler = (request, invocation) => {
+  console.log(`[permissions] AGENT auto-approve: ${request.kind} (session: ${invocation.sessionId.slice(0, 8)})`);
+  return { kind: 'approve-once' };
+};
+
+/** Ask mode: allow reads, reject writes and shell. */
+const askPermissionHandler = (request, invocation) => {
+  if (request.kind === 'read' || request.kind === 'url') {
+    console.log(`[permissions] ASK approve: ${request.kind}`);
+    return { kind: 'approve-once' };
+  }
+  console.log(`[permissions] ASK reject: ${request.kind}`);
+  return { kind: 'reject' };
+};
+
+/** Plan mode: reject all tool execution. */
+const planPermissionHandler = (request, invocation) => {
+  console.log(`[permissions] PLAN reject: ${request.kind}`);
+  return { kind: 'reject' };
+};
+
+function getPermissionHandler(mode) {
+  switch (mode) {
+    case 'agent': return agentPermissionHandler;
+    case 'ask': return askPermissionHandler;
+    case 'plan': return planPermissionHandler;
+    default: return agentPermissionHandler;
+  }
+}
+
+// Tool exclusions per mode — hides tools from the model so it doesn't try them
+function getExcludedTools(mode) {
+  switch (mode) {
+    case 'agent': return [];
+    case 'ask': return ['shell', 'write', 'custom-tool'];
+    case 'plan': return ['shell', 'write', 'read', 'custom-tool', 'mcp'];
+    default: return [];
+  }
+}
+
+const MODE_LABELS = {
+  agent: '🤖 Agent',
+  ask: '💬 Ask',
+  plan: '📋 Plan',
+};
 
 /**
- * CopilotBridge v2 — Pipe mode process manager.
- *
- * Spawns a fresh `copilot -p <prompt>` per message with `--resume=<sessionId>`
- * for conversation persistence. No PTY, no debounce — process exit = response complete.
- *
- * Based on the AgentSquad pattern (CopilotCliProcessManager.cs).
+ * CopilotBridge v3 — Copilot SDK integration with permission modes.
  */
 export class CopilotBridge extends EventEmitter {
   constructor() {
     super();
+    this.client = null;
+    this.session = null;
     this.sessionId = null;
+    this.mode = 'agent'; // default to full autonomy
     this.busy = false;
     this.messageQueue = [];
-    this.currentProcess = null;
     this.requestCount = 0;
     this.startTime = Date.now();
-    this._loadSession();
+    this._loadState();
   }
 
-  _loadSession() {
+  _loadState() {
     if (existsSync(config.stateFile)) {
       try {
         const state = JSON.parse(readFileSync(config.stateFile, 'utf-8'));
         if (state.sessionId) {
           this.sessionId = state.sessionId;
-          console.log(`[bridge] Resumed session: ${this.sessionId}`);
-          return;
+          console.log(`[bridge] Found saved session: ${this.sessionId.slice(0, 8)}…`);
+        }
+        if (state.mode && MODE_LABELS[state.mode]) {
+          this.mode = state.mode;
+          console.log(`[bridge] Restored mode: ${this.mode}`);
         }
       } catch (err) {
         console.warn(`[bridge] Failed to read state file: ${err.message}`);
       }
     }
-    this.sessionId = randomUUID();
-    this._saveSession();
-    console.log(`[bridge] New session: ${this.sessionId}`);
   }
 
-  _saveSession() {
+  _saveState() {
     try {
       writeFileSync(config.stateFile, JSON.stringify({
         sessionId: this.sessionId,
-        createdAt: new Date().toISOString(),
+        mode: this.mode,
+        savedAt: new Date().toISOString(),
       }, null, 2));
     } catch (err) {
       console.error(`[bridge] Failed to save state: ${err.message}`);
     }
   }
 
-  /** Start a new conversation session. Returns the new session ID. */
-  newSession() {
-    this.sessionId = randomUUID();
-    this._saveSession();
-    console.log(`[bridge] New session: ${this.sessionId}`);
-    return this.sessionId;
+  /** Initialize the Copilot SDK client. */
+  async start() {
+    console.log('[bridge] Starting Copilot SDK client…');
+
+    const clientOpts = {
+      autoStart: true,
+      autoRestart: true,
+      cliArgs: ['--autopilot'],
+    };
+
+    if (config.copilot.cliPath) {
+      clientOpts.cliPath = config.copilot.cliPath;
+      console.log(`[bridge] Using CLI: ${config.copilot.cliPath}`);
+    }
+
+    console.log('[bridge] CLI args: --autopilot');
+    this.client = new CopilotClient(clientOpts);
+    await this.client.start();
+    this._ownCliPid = this.client._process?.pid || null;
+    console.log('[bridge] Copilot SDK client ready');
+
+    await this._ensureSession();
+    return this;
   }
 
-  /** Get current session ID. */
-  getSessionId() {
-    return this.sessionId;
+  /** Build session config for the current mode. */
+  _sessionConfig() {
+    const cfg = {
+      model: config.copilot.model,
+      streaming: true,
+      onPermissionRequest: getPermissionHandler(this.mode),
+    };
+    const excluded = getExcludedTools(this.mode);
+    if (excluded.length > 0) {
+      cfg.excludedTools = excluded;
+    }
+
+    // System message to inform the model of its actual permission state
+    if (this.mode === 'agent') {
+      cfg.systemMessage = 'You are running in Agent mode with full autopilot permissions. You CAN and SHOULD execute shell commands, read/write files, and use all tools directly. Do NOT tell the user to run commands manually — execute them yourself.';
+    } else if (this.mode === 'ask') {
+      cfg.systemMessage = 'You are running in Ask mode. You can read files for context but cannot execute shell commands or write files. Answer questions based on what you can read.';
+    } else if (this.mode === 'plan') {
+      cfg.systemMessage = 'You are running in Plan mode. Describe what you would do but do not execute any tools. Provide step-by-step plans the user can review.';
+    }
+
+    return cfg;
   }
 
-  /**
-   * Send a message to Copilot. If busy, queues it.
-   * @param {string} text - The user's message
-   * @param {string[]} imagePaths - Optional array of local image file paths
-   * @returns {Promise<{text: string, exitCode: number}>}
-   */
+  /** Apply server-side permission settings based on current mode. */
+  async _applyServerPermissions(session) {
+    try {
+      if (this.mode === 'agent') {
+        await session.rpc.permissions.setApproveAll({ enabled: true });
+        console.log('[bridge] Server-side setApproveAll: ENABLED');
+      } else {
+        await session.rpc.permissions.setApproveAll({ enabled: false });
+        console.log('[bridge] Server-side setApproveAll: DISABLED');
+      }
+    } catch (err) {
+      console.warn(`[bridge] setApproveAll RPC failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  /** Create or resume the persistent session. */
+  async _ensureSession() {
+    if (this.session) return this.session;
+
+    const sessionCfg = this._sessionConfig();
+
+    if (this.sessionId) {
+      try {
+        console.log(`[bridge] Resuming session ${this.sessionId.slice(0, 8)}… (mode: ${this.mode})`);
+        this.session = await this.client.resumeSession(this.sessionId, sessionCfg);
+        console.log(`[bridge] Session resumed successfully`);
+        await this._applyServerPermissions(this.session);
+        return this.session;
+      } catch (err) {
+        console.warn(`[bridge] Could not resume session: ${err.message}. Creating new.`);
+        this.sessionId = null;
+      }
+    }
+
+    console.log(`[bridge] Creating new session (model: ${config.copilot.model}, mode: ${this.mode})`);
+    this.session = await this.client.createSession(sessionCfg);
+    this.sessionId = this.session.sessionId;
+    this._saveState();
+    console.log(`[bridge] New session: ${this.sessionId.slice(0, 8)}…`);
+    await this._applyServerPermissions(this.session);
+    return this.session;
+  }
+
+  /** Change the permission mode. Reconnects the session with new config. */
+  async setMode(newMode) {
+    if (!MODE_LABELS[newMode]) {
+      throw new Error(`Invalid mode: ${newMode}. Use: agent, ask, plan`);
+    }
+    if (newMode === this.mode) return this.mode;
+
+    const oldMode = this.mode;
+    this.mode = newMode;
+    this._saveState();
+    console.log(`[bridge] Mode: ${oldMode} → ${newMode}`);
+
+    // Disconnect current session
+    if (this.session) {
+      try { await this.session.disconnect(); } catch {}
+      this.session = null;
+    }
+
+    // When switching TO agent mode, always start fresh to clear any
+    // conversation history where the model learned it was restricted.
+    if (newMode === 'agent') {
+      this.sessionId = null;
+      console.log('[bridge] Agent mode: creating fresh session (clearing restriction history)');
+    }
+
+    try {
+      await this._ensureSession();
+    } catch (err) {
+      console.error(`[bridge] Failed to reconnect after mode change: ${err.message}`);
+      this.mode = oldMode;
+      this._saveState();
+      throw err;
+    }
+
+    return this.mode;
+  }
+
   async sendMessage(text, imagePaths = []) {
     if (this.busy) {
       return new Promise((resolve, reject) => {
         this.messageQueue.push({ text, imagePaths, resolve, reject });
-        this.emit('queued', text, this.messageQueue.length);
+        this.emit('queued', this.messageQueue.length);
       });
     }
     return this._executeMessage(text, imagePaths);
@@ -89,16 +245,22 @@ export class CopilotBridge extends EventEmitter {
     this.emit('busy', true);
 
     try {
-      let prompt = text;
-      if (imagePaths.length > 0) {
-        const refs = imagePaths
-          .map(p => `Please analyze the image at: ${p}`)
-          .join('\n');
-        prompt = `${refs}\n\n${text || 'What is in this image?'}`;
-      }
-
-      const result = await this._runCopilot(prompt);
+      const session = await this._ensureSession();
+      const result = await this._runWithEvents(session, text, imagePaths);
       return result;
+    } catch (err) {
+      if (/closed|destroy|disposed|invalid|expired|not found/i.test(err.message)) {
+        console.warn(`[bridge] Session appears dead, recreating…`);
+        this.session = null;
+        this.sessionId = null;
+        try {
+          const session = await this._ensureSession();
+          return await this._runWithEvents(session, text, imagePaths);
+        } catch (retryErr) {
+          throw retryErr;
+        }
+      }
+      throw err;
     } finally {
       this.busy = false;
       this.emit('busy', false);
@@ -106,84 +268,69 @@ export class CopilotBridge extends EventEmitter {
     }
   }
 
-  _runCopilot(prompt) {
-    return new Promise((resolve, reject) => {
-      const args = [
-        '-p', prompt,
-        '--no-ask-user',
-        '--no-auto-update',
-        '--no-custom-instructions',
-        '--no-color',
-        '--silent',
-        '--allow-all',
-        `--resume=${this.sessionId}`,
-      ];
+  async _runWithEvents(session, text, imagePaths) {
+    const tools = [];
+    let accumulated = '';
+    let lastToolName = '';
 
-      if (config.copilot.model) {
-        args.push('--model', config.copilot.model);
+    const unsubDelta = session.on('assistant.message_delta', (event) => {
+      accumulated += event.data.deltaContent;
+      this.emit('delta', accumulated);
+    });
+
+    const unsubToolStart = session.on('tool.execution_start', (event) => {
+      const toolName = event.data?.toolName || event.data?.name || 'tool';
+      tools.push(toolName);
+      lastToolName = toolName;
+      this.emit('tool_start', toolName);
+    });
+
+    const unsubToolDone = session.on('tool.execution_complete', (event) => {
+      const toolName = event.data?.toolName || event.data?.name || 'tool';
+      this.emit('tool_done', toolName);
+    });
+
+    try {
+      const attachments = imagePaths.map(path => ({
+        type: 'file',
+        path,
+        displayName: 'image',
+      }));
+
+      const opts = { prompt: text };
+      if (attachments.length > 0) {
+        opts.attachments = attachments;
       }
 
-      console.log(`[bridge] Spawning copilot (session=${this.sessionId.slice(0, 8)}...)`);
+      const result = await session.sendAndWait(opts, config.copilot.timeoutMs);
+      const finalText = result?.data?.content || accumulated || '(No response)';
 
-      const proc = spawn(config.copilot.path, args, {
-        cwd: config.copilot.cwd,
-        windowsHide: true,
-        env: { ...process.env, NO_COLOR: '1' },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-
-      // Close stdin immediately — prompt is passed via -p flag
-      proc.stdin.end();
-
-      this.currentProcess = proc;
-      let stdout = '';
-      let stderr = '';
-      let settled = false;
-
-      proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-      proc.stderr.on('data', (chunk) => {
-        const s = chunk.toString();
-        stderr += s;
-        if (s.trim()) console.log(`[copilot:stderr] ${s.trim()}`);
-      });
-
-      const timeoutMs = config.copilot.timeoutSeconds * 1000;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        console.warn(`[bridge] Copilot timed out after ${config.copilot.timeoutSeconds}s`);
-        try { proc.kill('SIGTERM'); } catch {}
-        setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
-        reject(new Error(`Copilot timed out after ${config.copilot.timeoutSeconds}s`));
-      }, timeoutMs);
-
-      proc.on('close', (code) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.currentProcess = null;
-
-        const response = cleanOutput(stdout);
-        console.log(`[bridge] Copilot exited (code=${code}, stdout=${response.length} chars)`);
-
-        if (response) {
-          resolve({ text: response, exitCode: code });
-        } else if (code !== 0) {
-          const errMsg = stderr.trim() || `Process exited with code ${code}`;
-          reject(new Error(errMsg));
-        } else {
-          resolve({ text: '(empty response)', exitCode: 0 });
-        }
-      });
-
-      proc.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.currentProcess = null;
-        reject(err);
-      });
-    });
+      return { text: finalText, tools };
+    } catch (err) {
+      // On timeout, return whatever content we accumulated via streaming
+      if (/timeout/i.test(err.message) && accumulated.length > 0) {
+        console.warn(`[bridge] Timeout after ${config.copilot.timeoutMs}ms — returning ${accumulated.length} chars of accumulated content`);
+        const suffix = `\n\n⏱️ _Response was still in progress when the ${Math.round(config.copilot.timeoutMs / 1000)}s timeout was reached. The work may still be running in the background. Send a follow-up message to check status._`;
+        return { text: accumulated + suffix, tools, timedOut: true };
+      }
+      // On timeout with no content, report what tools were running
+      if (/timeout/i.test(err.message)) {
+        console.warn(`[bridge] Timeout with no accumulated content. Tools used: ${tools.join(', ') || 'none'}`);
+        const toolInfo = tools.length > 0
+          ? `Tools executed: ${tools.join(', ')}`
+          : 'No tool output captured';
+        return {
+          text: `⏱️ The request timed out after ${Math.round(config.copilot.timeoutMs / 1000)} seconds, but the work may still be running in the background.\n\n${toolInfo}\n\nSend a follow-up message like "what's the status?" to check progress.`,
+          tools,
+          timedOut: true,
+        };
+      }
+      throw err;
+    } finally {
+      unsubDelta();
+      unsubToolStart();
+      unsubToolDone();
+    }
   }
 
   _processNext() {
@@ -192,51 +339,89 @@ export class CopilotBridge extends EventEmitter {
     this._executeMessage(text, imagePaths).then(resolve).catch(reject);
   }
 
-  /** Cancel the running copilot process and clear the queue. */
-  cancel() {
-    if (this.currentProcess) {
-      try { this.currentProcess.kill('SIGTERM'); } catch {}
+  async newSession() {
+    if (this.session) {
+      try { await this.session.disconnect(); } catch {}
     }
-    // Reject all queued messages
+    this.session = null;
+    this.sessionId = null;
+
+    console.log('[bridge] Creating fresh session…');
+    const session = await this._ensureSession();
+    return session.sessionId;
+  }
+
+  async cancel() {
+    if (this.session) {
+      try { await this.session.abort(); } catch {}
+    }
     for (const item of this.messageQueue) {
       item.reject(new Error('Cancelled'));
     }
     this.messageQueue = [];
   }
 
+  async listModels() {
+    if (!this.client) return [];
+    try {
+      return await this.client.listModels();
+    } catch {
+      return [];
+    }
+  }
+
+  listActiveSessions() {
+    return discoverSessions(this._ownCliPid);
+  }
+
+  async switchSession(sessionId, cwd = null) {
+    if (this.busy) {
+      throw new Error('Cannot switch sessions while a request is in progress.');
+    }
+
+    if (this.session) {
+      try { await this.session.disconnect(); } catch {}
+      this.session = null;
+    }
+
+    console.log(`[bridge] Switching to session ${sessionId.slice(0, 8)}… (cwd: ${cwd || 'default'}, mode: ${this.mode})`);
+
+    this.session = await this.client.resumeSession(sessionId, this._sessionConfig());
+    this.sessionId = sessionId;
+    this._saveState();
+    await this._applyServerPermissions(this.session);
+    console.log(`[bridge] Switched to session ${sessionId.slice(0, 8)}…`);
+    return sessionId;
+  }
+
   getStatus() {
     return {
       state: this.busy ? 'busy' : 'idle',
       sessionId: this.sessionId,
+      model: config.copilot.model,
+      mode: this.mode,
+      modeLabel: MODE_LABELS[this.mode],
       queueLength: this.messageQueue.length,
       requestCount: this.requestCount,
       uptimeSeconds: Math.round((Date.now() - this.startTime) / 1000),
     };
   }
 
-  /** Verify the copilot CLI is installed and reachable. */
-  async verifyCliAvailable() {
-    return new Promise((resolve) => {
-      const proc = spawn(config.copilot.path, ['--version'], {
-        windowsHide: true,
-        timeout: 15000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let output = '';
-      proc.stdout.on('data', (d) => { output += d.toString(); });
-      proc.on('close', (code) => resolve(code === 0 ? output.trim() : null));
-      proc.on('error', () => resolve(null));
-    });
-  }
-
-  /** Ensure the temp directory for image downloads exists. */
   ensureTempDir() {
     if (!existsSync(config.tempDir)) {
       mkdirSync(config.tempDir, { recursive: true });
     }
   }
 
-  destroy() {
-    this.cancel();
+  async destroy() {
+    await this.cancel();
+    if (this.session) {
+      try { await this.session.disconnect(); } catch {}
+    }
+    if (this.client) {
+      try { await this.client.stop(); } catch {}
+    }
   }
 }
+
+export { MODE_LABELS };
