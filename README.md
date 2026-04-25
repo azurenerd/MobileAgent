@@ -80,6 +80,9 @@ npm start
 
 | Command | Description |
 |---------|-------------|
+| `/screenshot` | 📸 Auto-detect running web app and capture with Playwright |
+| `/screenshot <url>` | Capture a specific URL (e.g., `http://localhost:3000`) |
+| `/screenshot desktop` | Raw desktop screenshot |
 | `/status` | Bridge state, mode, session ID, uptime |
 | `/cancel` | Cancel current request, clear queue |
 | `/model` | Show or change the AI model |
@@ -90,6 +93,7 @@ npm start
 
 - **🤖 Permission Modes** — `/agent` for full tool execution, `/ask` for read-only, `/plan` for suggestions
 - **🔀 Session Switching** — Connect to any active Copilot CLI terminal session from your phone
+- **📸 Smart Screenshots** — Auto-detects running dev servers and captures web apps via Playwright headless Chromium
 - **📱 Text Messages** — Type anything to chat with Copilot
 - **📷 Photo Support** — Send a photo for image analysis
 - **⏳ Live Progress** — Shows tool activity and elapsed time during long operations
@@ -119,6 +123,7 @@ npm start
 - `src/index.js` — Entry point, custom Telegram polling loop (handles 409 conflicts)
 - `src/bridge.js` — Copilot SDK integration, session management, permission modes
 - `src/telegram.js` — Telegram bot commands and message handling
+- `src/screenshot.js` — Playwright web capture + TCP port detection for dev servers
 - `src/sessions.js` — Discovers active CLI sessions (process scan + SQLite)
 - `src/formatter.js` — CLI-style message formatting for Telegram
 - `src/config.js` — Environment config with auto-detection of copilot.exe
