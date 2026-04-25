@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import https from 'https';
@@ -203,6 +203,7 @@ export function createTelegramBot(bridge) {
     `<b>Commands:</b>\n` +
     `  /sessions — List active CLI sessions\n` +
     `  /switch &lt;n&gt; — Switch to session N\n` +
+    `  /screenshot — Capture &amp; send screen\n` +
     `  /status — Bridge &amp; session info\n` +
     `  /new — Start a new conversation\n` +
     `  /help — Show this help`,
@@ -219,6 +220,9 @@ export function createTelegramBot(bridge) {
     `  /switch &lt;n&gt; — Connect to session N\n` +
     `  /new — Fresh conversation\n\n` +
     `<b>Other:</b>\n` +
+    `  /screenshot — 📸 Auto-detect &amp; capture running app\n` +
+    `  /screenshot &lt;url&gt; — Capture a specific URL\n` +
+    `  /screenshot desktop — Raw desktop capture\n` +
     `  /status — Session info, mode &amp; uptime\n` +
     `  /cancel — Cancel current request\n` +
     `  /model — Current model\n` +
@@ -347,6 +351,71 @@ export function createTelegramBot(bridge) {
       );
     } catch (err) {
       await ctx.reply(formatSystem(`❌ Mode switch failed: ${err.message}`), { parse_mode: 'HTML' });
+    }
+  });
+
+  // ─── Screenshot ─────────────────────────────────────────────────
+
+  bot.command('screenshot', async (ctx) => {
+    const arg = ctx.match?.trim() || '';
+    let statusMsg;
+
+    try {
+      // Determine mode from argument
+      let label;
+      if (arg === 'desktop') {
+        label = 'Capturing desktop…';
+      } else if (/^https?:\/\//.test(arg)) {
+        label = `Capturing ${arg}…`;
+      } else {
+        label = 'Detecting running app…';
+      }
+
+      statusMsg = await ctx.reply(`📸 <i>${escapeHtml(label)}</i>`, { parse_mode: 'HTML' });
+
+      const result = await bridge.captureFeature(arg || null);
+
+      if (result.mode === 'no-server') {
+        // No server found — inform user
+        await editMessage(ctx.chat.id, statusMsg.message_id,
+          `📸 <b>No running web server detected</b>\n\n` +
+          `Project: <code>${escapeHtml(result.projectDir || 'unknown')}</code>\n\n` +
+          `Try:\n` +
+          `• <code>/screenshot http://localhost:3000</code> — specific URL\n` +
+          `• <code>/screenshot desktop</code> — raw desktop capture\n` +
+          `• Start a dev server first, then retry /screenshot`
+        );
+        return;
+      }
+
+      // Send the screenshot photo
+      await bot.api.sendPhoto(ctx.chat.id, new InputFile(result.filePath));
+      bridge.cleanupFile(result.filePath);
+
+      // Add caption about what was captured
+      let caption = '';
+      if (result.mode === 'auto') {
+        caption = `🌐 Captured: <code>${escapeHtml(result.url)}</code>`;
+      } else if (result.mode === 'url') {
+        caption = `🌐 Captured: <code>${escapeHtml(result.url)}</code>`;
+      } else if (result.mode === 'desktop-fallback') {
+        caption = `🖥️ Desktop fallback (web capture failed for ${escapeHtml(result.url || 'unknown')})`;
+      } else {
+        caption = `🖥️ Desktop screenshot`;
+      }
+
+      // Remove "capturing" message and send caption
+      if (statusMsg) {
+        try { await bot.api.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch {}
+      }
+      await ctx.reply(caption, { parse_mode: 'HTML' });
+    } catch (err) {
+      const errText = formatSystem(`❌ Screenshot failed: ${err.message}`);
+      if (statusMsg) {
+        await editMessage(ctx.chat.id, statusMsg.message_id, errText);
+      } else {
+        await ctx.reply(errText, { parse_mode: 'HTML' });
+      }
     }
   });
 

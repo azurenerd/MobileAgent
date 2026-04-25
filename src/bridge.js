@@ -1,8 +1,11 @@
 import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { EventEmitter } from 'events';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { join } from 'path';
+import { execFile } from 'child_process';
 import { config } from './config.js';
 import { discoverSessions } from './sessions.js';
+import { detectProjectServer, captureWebPage, closeBrowser } from './screenshot.js';
 
 // ─── Permission handlers per mode ────────────────────────────────────
 
@@ -413,6 +416,106 @@ export class CopilotBridge extends EventEmitter {
     }
   }
 
+  /** Capture a screenshot of the primary screen, returns the file path. */
+  async captureScreen() {
+    this.ensureTempDir();
+    const filePath = join(config.tempDir, `screenshot-${Date.now()}.png`);
+
+    const psScript = `
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap($b.Width,$b.Height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+$bmp.Save('${filePath.replace(/\\/g, '\\\\')}')
+$g.Dispose(); $bmp.Dispose()
+Write-Output 'OK'
+`.trim();
+
+    return new Promise((resolve, reject) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+        timeout: 15000,
+      }, (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(`Screenshot capture failed: ${err.message}`));
+          return;
+        }
+        if (!existsSync(filePath)) {
+          reject(new Error(`Screenshot file not created. stderr: ${stderr}`));
+          return;
+        }
+        console.log(`[bridge] Screenshot captured: ${filePath}`);
+        resolve(filePath);
+      });
+    });
+  }
+
+  /**
+   * Smart screenshot: detect running web app and capture it with Playwright.
+   *
+   * @param {string|null} urlOrMode
+   *   - null / undefined → auto-detect running server for current project
+   *   - "desktop" → raw desktop capture (existing captureScreen)
+   *   - a URL string → screenshot that specific URL
+   * @returns {Promise<{filePath: string, mode: string, url?: string, port?: number}>}
+   */
+  async captureFeature(urlOrMode = null) {
+    // Desktop fallback
+    if (urlOrMode === 'desktop') {
+      const filePath = await this.captureScreen();
+      return { filePath, mode: 'desktop' };
+    }
+
+    // Explicit URL
+    if (urlOrMode && /^https?:\/\//.test(urlOrMode)) {
+      const filePath = await captureWebPage(urlOrMode);
+      return { filePath, mode: 'url', url: urlOrMode };
+    }
+
+    // Auto-detect: find the project directory from sessions
+    let projectDir = null;
+
+    // Try to find the project dir from the active session's discovered sessions
+    if (this.sessionId) {
+      try {
+        const sessions = this.listActiveSessions();
+        const match = sessions.find(s => s.sessionId === this.sessionId);
+        if (match?.projectPath) {
+          projectDir = match.projectPath;
+        }
+      } catch {}
+    }
+
+    // If no project dir from session, try bridge cwd
+    if (!projectDir) {
+      projectDir = process.cwd();
+    }
+
+    console.log(`[bridge] captureFeature: auto-detecting server for ${projectDir}`);
+    const server = await detectProjectServer(projectDir);
+
+    if (server) {
+      const url = `http://localhost:${server.port}`;
+      console.log(`[bridge] Found server at ${url} (PID: ${server.pid})`);
+      try {
+        const filePath = await captureWebPage(url);
+        return { filePath, mode: 'auto', url, port: server.port };
+      } catch (err) {
+        console.warn(`[bridge] Playwright capture failed: ${err.message}, falling back to desktop`);
+        const filePath = await this.captureScreen();
+        return { filePath, mode: 'desktop-fallback', url };
+      }
+    }
+
+    // No server found — return info, don't auto-fallback to desktop
+    return { filePath: null, mode: 'no-server', projectDir };
+  }
+
+  /** Delete a temp file (for cleanup after sending). */
+  cleanupFile(filePath) {
+    try { unlinkSync(filePath); } catch {}
+  }
+
   async destroy() {
     await this.cancel();
     if (this.session) {
@@ -421,6 +524,7 @@ export class CopilotBridge extends EventEmitter {
     if (this.client) {
       try { await this.client.stop(); } catch {}
     }
+    await closeBrowser();
   }
 }
 
