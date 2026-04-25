@@ -1,11 +1,12 @@
-import { Bot, InputFile } from 'grammy';
+import { Bot, InputFile, InlineKeyboard } from 'grammy';
 import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import https from 'https';
 import http from 'http';
 import { config } from './config.js';
 import { formatRelativeTime } from './sessions.js';
-import { MODE_LABELS } from './bridge.js';
+import { getModeLabel } from './modes.js';
+import { getRecentAuditEntries, formatAuditEntries } from './audit-log.js';
 import {
   formatAssistant,
   formatToolActivity,
@@ -81,8 +82,14 @@ export function createTelegramBot(bridge) {
     return () => clearInterval(interval);
   }
 
+  // ─── State for /retry ────────────────────────────────────────────
+  let lastUserText = null;
+  let lastResultTimedOut = false;
+
   // ─── Core: process a user message through Copilot ───────────────
   async function handleUserMessage(ctx, text, imagePaths = []) {
+    lastUserText = text;
+    lastResultTimedOut = false;
     const chatId = ctx.chat.id;
     const userMsgId = ctx.message.message_id;
     const startTime = Date.now();
@@ -117,9 +124,21 @@ export function createTelegramBot(bridge) {
       }
     };
 
-    // Periodic progress updates every 30s during long operations
+    // Progress updates: fast initial proof-of-life at 5s, then every 8s
     let progressInterval = null;
+    let initialTimeout = null;
     if (statusMsg) {
+      initialTimeout = setTimeout(async () => {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        try {
+          await bot.api.editMessageText(
+            chatId, statusMsg.message_id,
+            `🔄 <i>Processing… (${elapsed}s)</i>`,
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
+      }, 5000);
+
       progressInterval = setInterval(async () => {
         const elapsed = Math.round((Date.now() - startTime) / 1000);
         const toolInfo = toolsUsed.length > 0
@@ -132,7 +151,7 @@ export function createTelegramBot(bridge) {
             { parse_mode: 'HTML' }
           );
         } catch {}
-      }, 30000);
+      }, 8000);
     }
 
     bridge.on('tool_start', onToolStart);
@@ -141,7 +160,9 @@ export function createTelegramBot(bridge) {
       const result = await bridge.sendMessage(text, imagePaths);
       stopTyping();
       bridge.off('tool_start', onToolStart);
+      if (initialTimeout) clearTimeout(initialTimeout);
       if (progressInterval) clearInterval(progressInterval);
+      if (result.timedOut) lastResultTimedOut = true;
 
       // Format the response in CLI style
       const formatted = formatAssistant(result.text);
@@ -155,6 +176,7 @@ export function createTelegramBot(bridge) {
     } catch (err) {
       stopTyping();
       bridge.off('tool_start', onToolStart);
+      if (initialTimeout) clearTimeout(initialTimeout);
       if (progressInterval) clearInterval(progressInterval);
 
       const errText = formatSystem(`❌ Error: ${err.message}`);
@@ -223,20 +245,28 @@ export function createTelegramBot(bridge) {
     `  /screenshot — 📸 Auto-detect &amp; capture running app\n` +
     `  /screenshot &lt;url&gt; — Capture a specific URL\n` +
     `  /screenshot desktop — Raw desktop capture\n` +
+    `  /retry — Resend last message\n` +
+    `  /history — Recent activity log\n` +
+    `  /last — Details of last request\n` +
     `  /status — Session info, mode &amp; uptime\n` +
     `  /cancel — Cancel current request\n` +
     `  /model — Current model\n` +
-    `  /model &lt;name&gt; — Switch model\n\n` +
+    `  /model &lt;name&gt; — Switch model (creates new session)\n\n` +
     `<b>Tips:</b>\n` +
     `  • Send a photo for image analysis\n` +
     `  • /sessions to see your open terminals\n` +
-    `  • /agent before asking it to do work`,
+    `  • /agent before asking it to do work\n` +
+    `  • /status shows quick mode-switch buttons`,
     { parse_mode: 'HTML' }
   ));
 
   bot.command('status', async (ctx) => {
     const s = bridge.getStatus();
     const emoji = s.state === 'idle' ? '🟢' : '⏳';
+    const keyboard = new InlineKeyboard()
+      .text('🤖 Agent', 'mode:agent')
+      .text('💬 Ask', 'mode:ask')
+      .text('📋 Plan', 'mode:plan');
     await ctx.reply(
       `${emoji} <b>Bridge Status</b>\n\n` +
       `State: <code>${s.state}</code>\n` +
@@ -246,13 +276,72 @@ export function createTelegramBot(bridge) {
       `Queue: <code>${s.queueLength}</code>\n` +
       `Requests: <code>${s.requestCount}</code>\n` +
       `Uptime: <code>${formatUptime(s.uptimeSeconds)}</code>`,
-      { parse_mode: 'HTML' }
+      { parse_mode: 'HTML', reply_markup: keyboard }
     );
+  });
+
+  // Handle inline keyboard button presses for mode switching
+  bot.callbackQuery(/^mode:(.+)$/, async (ctx) => {
+    const newMode = ctx.match[1];
+    try {
+      await bridge.setMode(newMode);
+      const label = getModeLabel(newMode);
+      await ctx.answerCallbackQuery({ text: `Switched to ${label}` });
+      // Update the status message in-place
+      const s = bridge.getStatus();
+      const emoji = s.state === 'idle' ? '🟢' : '⏳';
+      const keyboard = new InlineKeyboard()
+        .text('🤖 Agent', 'mode:agent')
+        .text('💬 Ask', 'mode:ask')
+        .text('📋 Plan', 'mode:plan');
+      await ctx.editMessageText(
+        `${emoji} <b>Bridge Status</b>\n\n` +
+        `State: <code>${s.state}</code>\n` +
+        `Mode: ${s.modeLabel}\n` +
+        `Session: <code>${s.sessionId ? s.sessionId.slice(0, 8) + '…' : 'none'}</code>\n` +
+        `Model: <code>${s.model}</code>\n` +
+        `Queue: <code>${s.queueLength}</code>\n` +
+        `Requests: <code>${s.requestCount}</code>\n` +
+        `Uptime: <code>${formatUptime(s.uptimeSeconds)}</code>`,
+        { parse_mode: 'HTML', reply_markup: keyboard }
+      );
+    } catch (err) {
+      await ctx.answerCallbackQuery({ text: `Failed: ${err.message}` });
+    }
   });
 
   bot.command('cancel', async (ctx) => {
     await bridge.cancel();
     await ctx.reply(formatSystem('Cancelled. Queue cleared.'), { parse_mode: 'HTML' });
+  });
+
+  bot.command('history', async (ctx) => {
+    const countArg = parseInt(ctx.match?.trim()) || 10;
+    const count = Math.min(countArg, 50);
+    const entries = getRecentAuditEntries(count);
+    const text = `📜 <b>Recent Activity (${entries.length})</b>\n\n<pre>${escapeHtml(formatAuditEntries(entries))}</pre>`;
+    await sendHtml(ctx.chat.id, text);
+  });
+
+  bot.command('last', async (ctx) => {
+    const entries = getRecentAuditEntries(1);
+    if (entries.length === 0) {
+      await ctx.reply(formatSystem('No activity logged yet.'), { parse_mode: 'HTML' });
+      return;
+    }
+    const e = entries[0];
+    const time = new Date(e.ts).toLocaleTimeString();
+    const duration = e.durationMs ? `${Math.round(e.durationMs / 1000)}s` : '?';
+    await ctx.reply(
+      `📋 <b>Last Request</b>\n\n` +
+      `Time: ${time}\n` +
+      `Mode: ${e.mode || '?'}\n` +
+      `Duration: ${duration}${e.timedOut ? ' ⏱️ (timed out)' : ''}\n` +
+      `Prompt: <code>${escapeHtml(e.promptPreview || '?')}</code>\n` +
+      `Response: <code>${escapeHtml(e.responsePreview || '?')}</code>\n` +
+      (e.tools?.length ? `Tools: ${e.tools.join(', ')}` : ''),
+      { parse_mode: 'HTML' }
+    );
   });
 
   bot.command('new', async (ctx) => {
@@ -273,8 +362,19 @@ export function createTelegramBot(bridge) {
   bot.command('model', async (ctx) => {
     const arg = ctx.match?.trim();
     if (arg) {
+      if (bridge.busy) {
+        await ctx.reply(formatSystem('⏳ Bridge is busy. Wait for it to finish before switching model.'), { parse_mode: 'HTML' });
+        return;
+      }
+      const oldModel = config.copilot.model;
       config.copilot.model = arg;
-      await ctx.reply(formatSystem(`Model switched to: ${arg}`), { parse_mode: 'HTML' });
+      try {
+        await bridge.newSession();
+        await ctx.reply(formatSystem(`Model switched to: ${arg}\nNew session created.`), { parse_mode: 'HTML' });
+      } catch (err) {
+        config.copilot.model = oldModel;
+        await ctx.reply(formatSystem(`Failed to switch model: ${err.message}\nReverted to ${oldModel}.`), { parse_mode: 'HTML' });
+      }
     } else {
       await ctx.reply(
         formatSystem(`Current model: ${config.copilot.model}`),
@@ -354,11 +454,32 @@ export function createTelegramBot(bridge) {
     }
   });
 
+  // ─── /retry command ─────────────────────────────────────────────
+
+  bot.command('retry', async (ctx) => {
+    if (!lastUserText) {
+      await ctx.reply(formatSystem('Nothing to retry. Send a message first.'), { parse_mode: 'HTML' });
+      return;
+    }
+    // Safety: if last result timed out in agent mode, require confirmation
+    if (lastResultTimedOut && bridge.mode === 'agent') {
+      await ctx.reply(
+        formatSystem('⚠️ Last request timed out in Agent mode — work may still be running.\nSend /retry confirm to force retry, or check status first.'),
+        { parse_mode: 'HTML' }
+      );
+      // Allow "/retry confirm" to bypass
+      if (ctx.match?.trim().toLowerCase() !== 'confirm') return;
+    }
+    await ctx.reply(formatSystem(`🔄 Retrying: "${lastUserText.slice(0, 60)}${lastUserText.length > 60 ? '…' : ''}"`), { parse_mode: 'HTML' });
+    await handleUserMessage(ctx, lastUserText);
+  });
+
   // ─── Screenshot ─────────────────────────────────────────────────
 
   bot.command('screenshot', async (ctx) => {
     const arg = ctx.match?.trim() || '';
     let statusMsg;
+    let tempFile = null;
 
     try {
       // Determine mode from argument
@@ -388,27 +509,27 @@ export function createTelegramBot(bridge) {
         return;
       }
 
-      // Send the screenshot photo
-      await bot.api.sendPhoto(ctx.chat.id, new InputFile(result.filePath));
-      bridge.cleanupFile(result.filePath);
+      tempFile = result.filePath;
 
-      // Add caption about what was captured
+      // Build native caption for single-card photo
       let caption = '';
-      if (result.mode === 'auto') {
-        caption = `🌐 Captured: <code>${escapeHtml(result.url)}</code>`;
-      } else if (result.mode === 'url') {
-        caption = `🌐 Captured: <code>${escapeHtml(result.url)}</code>`;
+      if (result.mode === 'auto' || result.mode === 'url') {
+        caption = `🌐 Captured: ${result.url}`;
       } else if (result.mode === 'desktop-fallback') {
-        caption = `🖥️ Desktop fallback (web capture failed for ${escapeHtml(result.url || 'unknown')})`;
+        caption = `🖥️ Desktop fallback (web capture failed for ${result.url || 'unknown'})`;
       } else {
         caption = `🖥️ Desktop screenshot`;
       }
 
-      // Remove "capturing" message and send caption
+      // Send photo with inline caption (single notification on phone)
+      await bot.api.sendPhoto(ctx.chat.id, new InputFile(tempFile), {
+        caption,
+      });
+
+      // Remove the "capturing…" status message
       if (statusMsg) {
         try { await bot.api.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch {}
       }
-      await ctx.reply(caption, { parse_mode: 'HTML' });
     } catch (err) {
       const errText = formatSystem(`❌ Screenshot failed: ${err.message}`);
       if (statusMsg) {
@@ -416,6 +537,9 @@ export function createTelegramBot(bridge) {
       } else {
         await ctx.reply(errText, { parse_mode: 'HTML' });
       }
+    } finally {
+      // Always clean up temp file, even on error
+      if (tempFile) bridge.cleanupFile(tempFile);
     }
   });
 
@@ -516,15 +640,17 @@ export function createTelegramBot(bridge) {
     const photos = ctx.message.photo;
     const largest = photos[photos.length - 1];
     const caption = ctx.message.caption || 'What is in this image?';
+    let localPath = null;
 
     try {
-      const localPath = await downloadTelegramFile(largest.file_id);
+      localPath = await downloadTelegramFile(largest.file_id);
       console.log(`[telegram] Downloaded photo: ${localPath}`);
       await handleUserMessage(ctx, caption, [localPath]);
-      try { unlinkSync(localPath); } catch {}
     } catch (err) {
       console.error('[telegram] Photo error:', err);
       await ctx.reply(formatSystem(`❌ Photo failed: ${err.message}`), { parse_mode: 'HTML' });
+    } finally {
+      if (localPath) try { unlinkSync(localPath); } catch {}
     }
   });
 

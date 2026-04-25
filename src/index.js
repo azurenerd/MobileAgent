@@ -2,6 +2,11 @@ import { CopilotBridge } from './bridge.js';
 import { createTelegramBot } from './telegram.js';
 import { formatSystem, formatSuccess } from './formatter.js';
 import { config } from './config.js';
+import { createLogger } from './logger.js';
+import { readdirSync, statSync, unlinkSync } from 'fs';
+import { join } from 'path';
+
+const log = createLogger('main');
 
 console.log('╔═══════════════════════════════════════════════╗');
 console.log('║   🟣 Copilot Mobile Assistant v3              ║');
@@ -22,6 +27,7 @@ async function startup() {
   // Start the Copilot SDK client + session
   console.log('[startup] Initializing Copilot SDK…');
   await bridge.start();
+  bridge.startHealthMonitor(60000); // 60s health checks
 
   const status = bridge.getStatus();
   console.log(`[startup] ✅ Session: ${status.sessionId?.slice(0, 8)}…`);
@@ -56,7 +62,7 @@ async function startup() {
         const updates = await bot.api.raw.getUpdates({
           offset: pollingOffset,
           timeout: 3,
-          allowed_updates: ['message'],
+          allowed_updates: ['message', 'callback_query'],
         });
 
         if (consecutiveErrors > 0) {
@@ -99,10 +105,71 @@ async function startup() {
   const stopPolling = () => { pollingActive = false; };
   bot._stopPolling = stopPolling;
 
-  pollLoop().catch(err => console.error('[telegram] Poll loop crashed:', err));
-  console.log('[telegram] Custom polling started. Waiting for messages…');
+  // Resilient polling: auto-restart on crash with backoff + Telegram notification
+  const MAX_POLL_RESTARTS = 10;
+  const POLL_RESTART_RESET_MS = 300_000; // 5 min healthy resets counter
 
-  // Send startup notification
+  async function resilientPollLoop() {
+    let restarts = 0;
+    let healthySince = Date.now();
+
+    while (true) {
+      try {
+        healthySince = Date.now();
+        await pollLoop();
+        break; // clean exit via pollingActive = false
+      } catch (err) {
+        // 409 errors are normal competing-instance conflicts, not crashes
+        const code = err?.error_code || err?.payload?.error_code;
+        if (code === 409) {
+          console.warn('[polling] 409 in poll loop, retrying in 5s…');
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
+
+        if (Date.now() - healthySince > POLL_RESTART_RESET_MS) {
+          restarts = 0; // was healthy for 5+ min, reset
+        }
+        restarts++;
+        console.error(`[polling] Loop crashed (${restarts}/${MAX_POLL_RESTARTS}):`, err.message);
+
+        if (restarts >= MAX_POLL_RESTARTS) {
+          console.error('[polling] Too many restarts. Exiting for process manager.');
+          try {
+            await sendHtml(config.telegram.chatId,
+              formatSystem(`🚨 Poll loop crashed ${MAX_POLL_RESTARTS} times. Exiting.\nError: ${err.message}`)
+            );
+          } catch {}
+          process.exit(1);
+        }
+
+        if (restarts === 1 || restarts % 5 === 0) {
+          try {
+            await sendHtml(config.telegram.chatId,
+              formatSystem(`⚠️ Poll loop crashed, auto-restarting (${restarts}x)\nError: ${err.message}`)
+            );
+          } catch {}
+        }
+
+        const backoff = Math.min(30000, 2000 * Math.pow(2, restarts - 1));
+        console.log(`[polling] Restarting in ${backoff / 1000}s…`);
+        await new Promise(r => setTimeout(r, backoff));
+      }
+    }
+  }
+
+  resilientPollLoop();
+  console.log('[telegram] Resilient polling started. Waiting for messages…');
+
+  // Health monitoring notifications
+  bridge.on('health_error', async (err) => {
+    try { await sendHtml(config.telegram.chatId, formatSystem(`⚠️ SDK health check failed: ${err.message}`)); } catch {}
+  });
+  bridge.on('health_recovered', async () => {
+    try { await sendHtml(config.telegram.chatId, formatSystem('✅ SDK connection recovered.')); } catch {}
+  });
+
+   // Send startup notification
   try {
     await sendHtml(config.telegram.chatId,
       formatSuccess(
@@ -115,6 +182,25 @@ async function startup() {
   } catch (err) {
     console.error('[telegram] Failed to send startup message:', err.message);
   }
+
+  // Periodic temp file sweeper — clean files older than 1 hour every 30 min
+  setInterval(() => {
+    try {
+      if (!config.tempDir) return;
+      const now = Date.now();
+      const maxAge = 60 * 60 * 1000; // 1 hour
+      for (const f of readdirSync(config.tempDir)) {
+        const fp = join(config.tempDir, f);
+        try {
+          const st = statSync(fp);
+          if (now - st.mtimeMs > maxAge) {
+            unlinkSync(fp);
+            console.log(`[cleanup] Removed old temp file: ${f}`);
+          }
+        } catch {}
+      }
+    } catch {}
+  }, 30 * 60 * 1000);
 }
 
 startup().catch((err) => {
@@ -127,6 +213,13 @@ startup().catch((err) => {
 async function shutdown(signal) {
   console.log(`\n[shutdown] Received ${signal}, cleaning up…`);
 
+  // Hard 10s deadline — if destroy() hangs (Playwright, SDK), force exit
+  const forceExit = setTimeout(() => {
+    console.error('[shutdown] Timed out after 10s. Force exiting.');
+    process.exit(1);
+  }, 10000);
+  forceExit.unref();
+
   try {
     if (sendHtml) {
       await sendHtml(config.telegram.chatId, formatSystem('🔌 Bridge shutting down. Goodbye!'));
@@ -137,8 +230,9 @@ async function shutdown(signal) {
     try { bot._stopPolling?.(); } catch {}
     try { await bot.stop(); } catch {}
   }
-  await bridge.destroy();
+  await bridge.destroy().catch(() => {});
 
+  clearTimeout(forceExit);
   console.log('[shutdown] Done.');
   process.exit(0);
 }
@@ -152,7 +246,14 @@ if (process.platform === 'win32') {
 
 process.on('uncaughtException', (err) => {
   console.error('[fatal] Uncaught exception:', err);
-  bridge.destroy().then(() => process.exit(1));
+  const forceExit = setTimeout(() => {
+    console.error('[fatal] Graceful shutdown timed out after 5s. Force exiting.');
+    process.exit(1);
+  }, 5000);
+  forceExit.unref();
+  bridge.destroy()
+    .catch((e) => console.error('[fatal] Error during destroy:', e.message))
+    .finally(() => { clearTimeout(forceExit); process.exit(1); });
 });
 
 process.on('unhandledRejection', (err) => {

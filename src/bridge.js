@@ -1,60 +1,29 @@
 import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { EventEmitter } from 'events';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { execFile } from 'child_process';
 import { config } from './config.js';
 import { discoverSessions } from './sessions.js';
 import { detectProjectServer, captureWebPage, closeBrowser } from './screenshot.js';
+import { getMode, getModeLabel, isValidMode } from './modes.js';
+import { auditLog } from './audit-log.js';
 
-// ─── Permission handlers per mode ────────────────────────────────────
-
-/** Agent mode: approve everything automatically. */
-const agentPermissionHandler = (request, invocation) => {
-  console.log(`[permissions] AGENT auto-approve: ${request.kind} (session: ${invocation.sessionId.slice(0, 8)})`);
-  return { kind: 'approve-once' };
-};
-
-/** Ask mode: allow reads, reject writes and shell. */
-const askPermissionHandler = (request, invocation) => {
-  if (request.kind === 'read' || request.kind === 'url') {
-    console.log(`[permissions] ASK approve: ${request.kind}`);
-    return { kind: 'approve-once' };
-  }
-  console.log(`[permissions] ASK reject: ${request.kind}`);
-  return { kind: 'reject' };
-};
-
-/** Plan mode: reject all tool execution. */
-const planPermissionHandler = (request, invocation) => {
-  console.log(`[permissions] PLAN reject: ${request.kind}`);
-  return { kind: 'reject' };
-};
+// ─── Permission helpers (delegated to modes.js) ────────────────────────
 
 function getPermissionHandler(mode) {
-  switch (mode) {
-    case 'agent': return agentPermissionHandler;
-    case 'ask': return askPermissionHandler;
-    case 'plan': return planPermissionHandler;
-    default: return agentPermissionHandler;
-  }
+  const modeConfig = getMode(mode);
+  return (request, invocation) => {
+    const decision = modeConfig.permission(request);
+    const action = decision.kind === 'approve-once' ? 'approve' : 'reject';
+    console.log(`[permissions] ${mode.toUpperCase()} ${action}: ${request.kind}`);
+    return decision;
+  };
 }
 
-// Tool exclusions per mode — hides tools from the model so it doesn't try them
 function getExcludedTools(mode) {
-  switch (mode) {
-    case 'agent': return [];
-    case 'ask': return ['shell', 'write', 'custom-tool'];
-    case 'plan': return ['shell', 'write', 'read', 'custom-tool', 'mcp'];
-    default: return [];
-  }
+  return getMode(mode).excludedTools;
 }
-
-const MODE_LABELS = {
-  agent: '🤖 Agent',
-  ask: '💬 Ask',
-  plan: '📋 Plan',
-};
 
 /**
  * CopilotBridge v3 — Copilot SDK integration with permission modes.
@@ -81,23 +50,25 @@ export class CopilotBridge extends EventEmitter {
           this.sessionId = state.sessionId;
           console.log(`[bridge] Found saved session: ${this.sessionId.slice(0, 8)}…`);
         }
-        if (state.mode && MODE_LABELS[state.mode]) {
+        if (state.mode && isValidMode(state.mode)) {
           this.mode = state.mode;
           console.log(`[bridge] Restored mode: ${this.mode}`);
         }
       } catch (err) {
-        console.warn(`[bridge] Failed to read state file: ${err.message}`);
+        console.warn(`[bridge] ⚠️ State file corrupted or unreadable: ${err.message}. Starting fresh.`);
       }
     }
   }
 
   _saveState() {
     try {
-      writeFileSync(config.stateFile, JSON.stringify({
+      const tmp = config.stateFile + '.tmp';
+      writeFileSync(tmp, JSON.stringify({
         sessionId: this.sessionId,
         mode: this.mode,
         savedAt: new Date().toISOString(),
       }, null, 2));
+      renameSync(tmp, config.stateFile);
     } catch (err) {
       console.error(`[bridge] Failed to save state: ${err.message}`);
     }
@@ -197,7 +168,7 @@ export class CopilotBridge extends EventEmitter {
 
   /** Change the permission mode. Reconnects the session with new config. */
   async setMode(newMode) {
-    if (!MODE_LABELS[newMode]) {
+    if (!isValidMode(newMode)) {
       throw new Error(`Invalid mode: ${newMode}. Use: agent, ask, plan`);
     }
     if (newMode === this.mode) return this.mode;
@@ -246,10 +217,16 @@ export class CopilotBridge extends EventEmitter {
     this.busy = true;
     this.requestCount++;
     this.emit('busy', true);
+    const startMs = Date.now();
 
     try {
       const session = await this._ensureSession();
       const result = await this._runWithEvents(session, text, imagePaths);
+      auditLog({
+        type: 'message', mode: this.mode, prompt: text,
+        response: result.text, tools: result.tools,
+        durationMs: Date.now() - startMs, timedOut: result.timedOut,
+      });
       return result;
     } catch (err) {
       if (/closed|destroy|disposed|invalid|expired|not found/i.test(err.message)) {
@@ -258,11 +235,19 @@ export class CopilotBridge extends EventEmitter {
         this.sessionId = null;
         try {
           const session = await this._ensureSession();
-          return await this._runWithEvents(session, text, imagePaths);
+          const result = await this._runWithEvents(session, text, imagePaths);
+          auditLog({
+            type: 'message-retry', mode: this.mode, prompt: text,
+            response: result.text, tools: result.tools,
+            durationMs: Date.now() - startMs, timedOut: result.timedOut,
+          });
+          return result;
         } catch (retryErr) {
+          auditLog({ type: 'error', mode: this.mode, prompt: text, error: retryErr.message, durationMs: Date.now() - startMs });
           throw retryErr;
         }
       }
+      auditLog({ type: 'error', mode: this.mode, prompt: text, error: err.message, durationMs: Date.now() - startMs });
       throw err;
     } finally {
       this.busy = false;
@@ -403,7 +388,7 @@ export class CopilotBridge extends EventEmitter {
       sessionId: this.sessionId,
       model: config.copilot.model,
       mode: this.mode,
-      modeLabel: MODE_LABELS[this.mode],
+      modeLabel: getModeLabel(this.mode),
       queueLength: this.messageQueue.length,
       requestCount: this.requestCount,
       uptimeSeconds: Math.round((Date.now() - this.startTime) / 1000),
@@ -516,7 +501,46 @@ Write-Output 'OK'
     try { unlinkSync(filePath); } catch {}
   }
 
+  /**
+   * Start a periodic health check for the SDK client.
+   * Only checks when idle (busy-aware per rubber-duck).
+   * Emits 'health_error' event on failure.
+   */
+  startHealthMonitor(intervalMs = 60000) {
+    if (this._healthInterval) return;
+    this._healthInterval = setInterval(async () => {
+      if (this.busy || !this.client) return;
+      try {
+        // Lightweight check: list models as a ping
+        await this.client.listModels();
+      } catch (err) {
+        console.error(`[health] SDK health check failed: ${err.message}`);
+        this.emit('health_error', err);
+        // Attempt to reconnect
+        try {
+          console.log('[health] Attempting SDK reconnect…');
+          if (this.session) try { await this.session.disconnect(); } catch {}
+          if (this.client) try { await this.client.stop(); } catch {}
+          await this.start();
+          console.log('[health] SDK reconnected successfully');
+          this.emit('health_recovered');
+        } catch (reconnErr) {
+          console.error(`[health] Reconnect failed: ${reconnErr.message}`);
+        }
+      }
+    }, intervalMs);
+    this._healthInterval.unref();
+  }
+
+  stopHealthMonitor() {
+    if (this._healthInterval) {
+      clearInterval(this._healthInterval);
+      this._healthInterval = null;
+    }
+  }
+
   async destroy() {
+    this.stopHealthMonitor();
     await this.cancel();
     if (this.session) {
       try { await this.session.disconnect(); } catch {}
@@ -527,5 +551,3 @@ Write-Output 'OK'
     await closeBrowser();
   }
 }
-
-export { MODE_LABELS };
