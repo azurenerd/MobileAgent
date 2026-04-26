@@ -6,7 +6,7 @@ import http from 'http';
 import { config } from './config.js';
 import { formatRelativeTime } from './sessions.js';
 import { getModeLabel } from './modes.js';
-import { getRecentAuditEntries, formatAuditEntries } from './audit-log.js';
+import { getRecentAuditEntries, getAuditEntriesSince, formatAuditEntries } from './audit-log.js';
 import {
   formatAssistant,
   formatToolActivity,
@@ -344,6 +344,64 @@ export function createTelegramBot(bridge) {
     );
   });
 
+  bot.command('summarize', async (ctx) => {
+    const arg = parseInt(ctx.match?.trim());
+    if (!arg || arg <= 0) {
+      await ctx.reply(
+        formatSystem('Usage: /summarize N\nSummarizes session activity from the last N minutes.\nExample: /summarize 30'),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const minutes = Math.min(arg, 1440); // cap at 24 hours
+    const entries = getAuditEntriesSince(minutes);
+
+    if (entries.length === 0) {
+      await ctx.reply(
+        formatSystem(`No activity found in the last ${minutes} minute${minutes === 1 ? '' : 's'}.`),
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    // Build a digest of activity for Copilot to summarize
+    const digest = entries.map(e => {
+      const time = new Date(e.ts).toLocaleTimeString();
+      const dur = e.durationMs ? `${Math.round(e.durationMs / 1000)}s` : '?';
+      const tools = e.tools?.length ? ` tools=[${e.tools.join(',')}]` : '';
+      const timeout = e.timedOut ? ' TIMED_OUT' : '';
+      return `[${time}] mode=${e.mode || '?'} dur=${dur}${timeout}${tools}\n  prompt: "${e.promptPreview || '?'}"\n  response: "${e.responsePreview || '?'}"`;
+    }).join('\n');
+
+    const summaryPrompt =
+      `Summarize the following Copilot session activity from the last ${minutes} minutes. ` +
+      `There were ${entries.length} request(s). Give a concise, human-friendly summary of what was worked on, ` +
+      `what tools were used, any timeouts or errors, and the overall outcome. ` +
+      `Keep it brief — 3-5 bullet points max.\n\n${digest}`;
+
+    // Send immediate acknowledgment then run through Copilot
+    const statusMsg = await ctx.reply(
+      `📊 <i>Summarizing last ${minutes} min (${entries.length} request${entries.length === 1 ? '' : 's'})…</i>`,
+      { parse_mode: 'HTML' }
+    );
+
+    const stopTyping = startTyping(ctx.chat.id);
+
+    try {
+      const result = await bridge.sendMessage(summaryPrompt);
+      stopTyping();
+
+      const header = `📊 <b>Session Summary</b> (last ${minutes} min, ${entries.length} requests)\n\n`;
+      await editMessage(ctx.chat.id, statusMsg.message_id, header + formatAssistant(result.text));
+    } catch (err) {
+      stopTyping();
+      await editMessage(ctx.chat.id, statusMsg.message_id,
+        formatSystem(`❌ Summary failed: ${err.message}`)
+      );
+    }
+  });
+
   bot.command('new', async (ctx) => {
     try {
       const newId = await bridge.newSession();
@@ -570,7 +628,9 @@ export function createTelegramBot(bridge) {
         const marker = isCurrent ? ' ✅ <i>connected</i>' : '';
         const name = s.projectName || s.sessionId.slice(0, 8);
         const path = s.projectPath ? `\n     📁 <code>${escapeHtml(s.projectPath)}</code>` : '';
-        const summary = s.summary ? `\n     💬 <i>${escapeHtml(s.summary.slice(0, 60))}</i>` : '';
+        // One-sentence summary: prefer checkpoint title, then session summary
+        const oneLiner = s.checkpointTitle || s.summary || null;
+        const summary = oneLiner ? `\n     💬 <i>${escapeHtml(oneLiner.slice(0, 120))}</i>` : '';
         const time = s.lastActive ? `\n     🕐 ${formatRelativeTime(s.lastActive)}` : '';
 
         lines.push(`${num} <b>${escapeHtml(name)}</b>${marker}${path}${summary}${time}\n`);

@@ -83,6 +83,23 @@ export function getRecentAuditEntries(count = 5) {
 }
 
 /**
+ * Get audit entries within a time window (last N minutes).
+ */
+export function getAuditEntriesSince(minutes) {
+  try {
+    if (!existsSync(AUDIT_FILE)) return [];
+    const content = readFileSync(AUDIT_FILE, 'utf-8').trim();
+    if (!content) return [];
+    const cutoff = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+    return content.split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(e => e && e.ts >= cutoff);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Format audit entries for display in Telegram.
  */
 export function formatAuditEntries(entries) {

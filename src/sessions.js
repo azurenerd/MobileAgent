@@ -47,6 +47,8 @@ export function discoverSessions(excludePid = null) {
       projectPath: proc.projectPath,
       projectName,
       summary: meta.summary || null,
+      checkpointTitle: meta.checkpointTitle || null,
+      checkpointOverview: meta.checkpointOverview || null,
       repository: meta.repository || null,
       pid: proc.pid,
       lastActive,
@@ -107,6 +109,7 @@ function scanCopilotProcesses(excludePid) {
 
 /**
  * Query the session-store.db for metadata about specific sessions.
+ * Also pulls the latest checkpoint title+overview for a richer summary.
  */
 function querySessionStore(sessionIds) {
   const metadata = new Map();
@@ -127,7 +130,34 @@ function querySessionStore(sessionIds) {
         repository: row.repository,
         summary: row.summary,
         updatedAt: row.updated_at,
+        checkpointTitle: null,
+        checkpointOverview: null,
       });
+    }
+
+    // Enrich with latest checkpoint title + overview per session
+    try {
+      const cpStmt = db.prepare(
+        `SELECT c.session_id, c.title, c.overview
+         FROM checkpoints c
+         INNER JOIN (
+           SELECT session_id, MAX(checkpoint_number) as max_cp
+           FROM checkpoints
+           WHERE session_id IN (${placeholders})
+           GROUP BY session_id
+         ) latest ON c.session_id = latest.session_id AND c.checkpoint_number = latest.max_cp`
+      );
+      const cpRows = cpStmt.all(...sessionIds);
+      for (const cp of cpRows) {
+        const meta = metadata.get(cp.session_id);
+        if (meta) {
+          meta.checkpointTitle = cp.title || null;
+          meta.checkpointOverview = cp.overview || null;
+        }
+      }
+    } catch (cpErr) {
+      // Checkpoint query is optional — don't fail the whole thing
+      console.warn('[sessions] Checkpoint query failed:', cpErr.message);
     }
 
     db.close();
