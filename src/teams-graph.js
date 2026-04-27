@@ -24,10 +24,19 @@ function validateGraphId(id, label) {
 
 // ─── Core Fetch with Retry ──────────────────────────────────────────
 
+const ALLOWED_GRAPH_ORIGINS = ['https://graph.microsoft.com', 'https://login.microsoftonline.com'];
+
 /**
  * Make a Graph API request with 3-retry exponential backoff for 429/503/504.
+ * Enforces that the URL targets Microsoft Graph or login endpoints only (prevents token leakage).
  */
 export async function graphFetch(url, accessToken, options = {}) {
+  // Security: only send bearer tokens to Microsoft Graph/login endpoints
+  const parsed = new URL(url);
+  if (!ALLOWED_GRAPH_ORIGINS.some(origin => url.startsWith(origin))) {
+    throw new Error(`Security: graphFetch refused non-Graph URL: ${parsed.origin}`);
+  }
+
   const maxRetries = 3;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const res = await fetch(url, {

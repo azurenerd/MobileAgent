@@ -81,6 +81,10 @@ export function createTeamsBot(bridge) {
   const processedIds = new LruSet(500);
   const sentByBridge = new LruSet(200); // message IDs posted by this bridge instance
 
+  // Invisible marker appended to all bridge-sent messages for self-chat dedup.
+  // This prevents the race where a message is polled before its ID is recorded in sentByBridge.
+  const BRIDGE_MARKER = '\u200B\u200C\u200B'; // zero-width spaces — invisible in Teams UI
+
   // Load persisted watermark
   const watermark = loadWatermark();
   let lastPollTimestamp = watermark.lastTimestamp ? new Date(watermark.lastTimestamp) : null;
@@ -89,7 +93,8 @@ export function createTeamsBot(bridge) {
   // ─── Send helpers ───────────────────────────────────────────────
 
   async function sendHtml(targetChatId, text) {
-    const chunks = chunkMessage(text);
+    const markedText = isSelfChat ? text + BRIDGE_MARKER : text;
+    const chunks = chunkMessage(markedText);
     let lastMsg = null;
     for (const chunk of chunks) {
       try {
@@ -550,6 +555,14 @@ export function createTeamsBot(bridge) {
 
         // Extract text content
         const rawContent = msg.body?.content || '';
+
+        // Self-chat: reject messages containing our invisible bridge marker (race-safe dedup)
+        if (isSelfChat && rawContent.includes(BRIDGE_MARKER)) {
+          processedIds.add(msg.id);
+          sentByBridge.add(msg.id);
+          continue;
+        }
+
         const text = stripHtml(rawContent).trim();
         if (!text) {
           processedIds.add(msg.id);
