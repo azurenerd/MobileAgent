@@ -37,12 +37,31 @@ function detectCliPath() {
   return null; // SDK will use its bundled CLI
 }
 
-export const config = {
-  telegram: {
+// Transport selection: 'telegram' (default) or 'teams'
+const transport = optional('TRANSPORT', 'telegram');
+
+function buildTelegramConfig() {
+  return {
     botToken: required('TELEGRAM_BOT_TOKEN'),
     userId: Number(required('TELEGRAM_USER_ID')),
     chatId: Number(required('TELEGRAM_CHAT_ID')),
-  },
+  };
+}
+
+function buildTeamsConfig() {
+  return {
+    clientId: optional('TEAMS_CLIENT_ID', '14d82eec-204b-4c2f-b7e8-296a70dab67e'),
+    tenantId: optional('TEAMS_TENANT_ID', 'organizations'),
+    recipientUpn: optional('TEAMS_RECIPIENT_UPN', ''),
+    chatId: optional('TEAMS_CHAT_ID', ''),
+    pollIntervalMs: Number(optional('TEAMS_POLL_INTERVAL_MS', '3000')),
+  };
+}
+
+export const config = {
+  transport,
+  telegram: transport === 'telegram' ? buildTelegramConfig() : {},
+  teams: transport === 'teams' ? buildTeamsConfig() : {},
   copilot: {
     model: optional('COPILOT_MODEL', 'claude-sonnet-4'),
     timeoutMs: Number(optional('COPILOT_TIMEOUT_SECONDS', '600')) * 1000,

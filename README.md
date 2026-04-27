@@ -1,16 +1,16 @@
-# Copilot Telegram Bridge v3
+# Copilot Mobile Bridge v3
 
-Control GitHub Copilot CLI from your phone via Telegram — while you're away from your desk. This bridge runs on your Windows PC and connects a private Telegram bot to the Copilot CLI through the **@github/copilot-sdk**, giving you full code generation, tool execution, session management, screenshots, and audit logging from anywhere.
+Control GitHub Copilot CLI from your phone via **Telegram** or **Microsoft Teams** — while you're away from your desk. This bridge runs on your Windows PC and connects your messaging app to the Copilot CLI through the **@github/copilot-sdk**, giving you full code generation, tool execution, session management, screenshots, and audit logging from anywhere.
 
 ```
-┌─────────┐       ┌──────────┐       ┌─────────────────────────────────┐
-│  iPhone  │◄────►│ Telegram │◄────►│  Node.js Bridge (your Windows PC)│
-│  (you)   │       │   API    │       │                                 │
-└─────────┘       └──────────┘       │  ┌───────────┐  ┌────────────┐  │
-                                      │  │ Copilot   │  │ Playwright │  │
-                                      │  │ SDK/CLI   │  │ (headless) │  │
-                                      │  └───────────┘  └────────────┘  │
-                                      └─────────────────────────────────┘
+┌─────────┐       ┌──────────────────┐       ┌─────────────────────────────────┐
+│  iPhone  │◄────►│ Telegram API     │◄────►│  Node.js Bridge (your Windows PC)│
+│  (you)   │      │   — or —         │       │                                 │
+│          │◄────►│ Microsoft Graph  │◄────►│  ┌───────────┐  ┌────────────┐  │
+└─────────┘       │ API (Teams)      │       │  │ Copilot   │  │ Playwright │  │
+                  └──────────────────┘       │  │ SDK/CLI   │  │ (headless) │  │
+                                             │  └───────────┘  └────────────┘  │
+                                             └─────────────────────────────────┘
 ```
 
 ---
@@ -18,7 +18,9 @@ Control GitHub Copilot CLI from your phone via Telegram — while you're away fr
 ## Table of Contents
 
 - [How It Works](#how-it-works)
-- [Quick Start](#quick-start)
+- [Transport Selection](#transport-selection)
+- [Quick Start — Telegram](#quick-start--telegram)
+- [Quick Start — Teams](#quick-start--teams)
 - [Configuration](#configuration)
 - [Commands Reference](#commands-reference)
 - [Permission Modes](#permission-modes)
@@ -26,6 +28,7 @@ Control GitHub Copilot CLI from your phone via Telegram — while you're away fr
 - [Smart Screenshots](#smart-screenshots)
 - [Retry & Error Recovery](#retry--error-recovery)
 - [Activity Audit Log](#activity-audit-log)
+- [Session Summarization](#session-summarization)
 - [Inline Keyboard](#inline-keyboard)
 - [Health Monitoring](#health-monitoring)
 - [Progress Indicators](#progress-indicators)
@@ -40,17 +43,41 @@ Control GitHub Copilot CLI from your phone via Telegram — while you're away fr
 
 ## How It Works
 
-1. The bridge runs a private Telegram bot on your Windows PC
-2. You send messages from your phone; only your Telegram user ID is accepted
+1. The bridge runs on your Windows PC with either a **Telegram bot** or **Teams chat** as the transport
+2. You send messages from your phone; only your authorized user is accepted
 3. Messages are routed to Copilot via the `@github/copilot-sdk` (JSON-RPC over stdio)
-4. Copilot processes the prompt with streaming — tool activity shows live in Telegram
+4. Copilot processes the prompt with streaming — tool activity shows live in your chat
 5. Responses come back formatted in CLI style (🟣 purple header, code blocks, markdown)
 6. Sessions persist across messages and bridge restarts (atomic state saves)
 7. If the bridge crashes, the resilient poll loop auto-recovers with exponential backoff
 
 ---
 
-## Quick Start
+## Transport Selection
+
+The bridge supports two messaging transports. Set the `TRANSPORT` environment variable to choose:
+
+| Transport | Value | Auth | Setup Time | Best For |
+|-----------|-------|------|------------|----------|
+| **Telegram** | `telegram` (default) | Bot token from BotFather | 5 min | Personal use, simple setup |
+| **Teams** | `teams` | One-time browser OAuth (PKCE) | 5 min | Corporate Microsoft accounts |
+
+### Telegram
+Uses the [grammY](https://grammy.dev/) library with long-polling. You create a private bot via BotFather, and the bridge polls for messages.
+
+### Teams
+Uses the **Microsoft Graph API** directly (following the [Squad framework](https://github.com/bradygaster/squad) pattern). No Bot Framework, no Azure Bot registration, no dev tunnel needed.
+
+**How Teams auth works:**
+- Uses the **Microsoft Graph PowerShell first-party client ID** (`14d82eec-204b-4c2f-b7e8-296a70dab67e`) — already registered in every Microsoft tenant
+- One-time browser OAuth with PKCE — token is cached and auto-refreshes silently
+- Device code fallback for headless environments (SSH, remote desktop)
+- No admin consent required with default Graph scopes
+- Messages posted and polled via Graph API 1:1 chat
+
+---
+
+## Quick Start — Telegram
 
 ### 1. Create a Telegram Bot
 
@@ -99,19 +126,81 @@ You'll see a startup message on your phone:
 
 ---
 
+## Quick Start — Teams
+
+### 1. Authenticate Copilot CLI
+
+Same as Telegram — run `copilot` once in a terminal to complete the GitHub OAuth login.
+
+### 2. Configure the Bridge
+
+```powershell
+cd copilot-telegram-bridge
+copy .env.example .env
+```
+
+Edit `.env` with Teams settings:
+
+```env
+TRANSPORT=teams
+TEAMS_RECIPIENT_UPN=your-other-account@microsoft.com
+COPILOT_MODEL=claude-sonnet-4
+COPILOT_TIMEOUT_SECONDS=600
+```
+
+**`TEAMS_RECIPIENT_UPN`** is the email address of the Teams user you'll chat with. This should be a **different** account from the one running the bridge (e.g., a second Microsoft account or a shared mailbox). This creates a 1:1 chat where you message from your phone and the bridge posts responses.
+
+### 3. Install & Run
+
+```powershell
+npm install
+npx playwright install chromium   # for /screenshot feature
+npm start
+```
+
+On first run, a **browser window opens** for Microsoft OAuth login. Sign in with your corporate account and grant the requested permissions. Tokens are cached in `~/.copilot/teams-tokens-*.json` and auto-refresh — you won't need to sign in again unless tokens expire permanently.
+
+**Headless/SSH fallback:** If no browser is available, the bridge displays a device code and URL. Navigate to the URL on any device and enter the code.
+
+> ✅ Copilot Mobile v3 online! Session: a1b2c3d4… Model: claude-sonnet-4. Transport: Teams. Send /help for commands.
+
+Open the Teams app on your phone, go to the 1:1 chat with the recipient account, and send `/help` to get started.
+
+---
+
 ## Configuration
 
 All settings are in the `.env` file. Copy `.env.example` to `.env` and fill in your values.
+
+### Core Settings
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TRANSPORT` | ❌ | `telegram` | Transport: `telegram` or `teams` |
+| `COPILOT_MODEL` | ❌ | `claude-sonnet-4` | Default AI model (changeable at runtime via `/model`) |
+| `COPILOT_TIMEOUT_SECONDS` | ❌ | `600` | Max seconds per request before timeout (10 min default) |
+| `COPILOT_CLI_PATH` | ❌ | Auto-detect | Path to `copilot.exe` — auto-detects WinGet install location |
+| `LOG_LEVEL` | ❌ | `info` | Structured log level: `debug`, `info`, `warn`, `error` |
+
+### Telegram Settings (when `TRANSPORT=telegram`)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from BotFather |
 | `TELEGRAM_USER_ID` | ✅ | — | Your Telegram user ID (only this user can interact) |
 | `TELEGRAM_CHAT_ID` | ✅ | — | Chat ID where the bot sends messages |
-| `COPILOT_MODEL` | ❌ | `claude-sonnet-4` | Default AI model (changeable at runtime via `/model`) |
-| `COPILOT_TIMEOUT_SECONDS` | ❌ | `600` | Max seconds per request before timeout (10 min default) |
-| `COPILOT_CLI_PATH` | ❌ | Auto-detect | Path to `copilot.exe` — auto-detects WinGet install location |
-| `LOG_LEVEL` | ❌ | `info` | Structured log level: `debug`, `info`, `warn`, `error` |
+
+### Teams Settings (when `TRANSPORT=teams`)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TEAMS_RECIPIENT_UPN` | ✅* | — | UPN of the Teams user to chat with (e.g., `user@microsoft.com`) |
+| `TEAMS_CHAT_ID` | ✅* | — | Existing chat ID (alternative to UPN — skip chat creation) |
+| `TEAMS_CLIENT_ID` | ❌ | `14d82eec…` | OAuth client ID (default: Microsoft Graph PowerShell first-party app) |
+| `TEAMS_TENANT_ID` | ❌ | `organizations` | Azure AD tenant ID (default: multi-tenant) |
+| `TEAMS_POLL_INTERVAL_MS` | ❌ | `3000` | How often to check for new messages (milliseconds) |
+
+*One of `TEAMS_RECIPIENT_UPN` or `TEAMS_CHAT_ID` must be set.
 
 **Impact of settings:**
 
@@ -144,6 +233,7 @@ All settings are in the `.env` file. Copy `.env.example` to `.env` and fill in y
 | `/history` | Show recent activity log (last 10 by default) |
 | `/history <n>` | Show last N activity entries (max 50) |
 | `/last` | Show details of the most recent request |
+| `/summarize <n>` | Summarize the last N minutes of session activity |
 
 ---
 
@@ -323,7 +413,38 @@ Shows detailed info about the most recent request: time, mode, duration, timeout
 
 ---
 
+## Session Summarization
+
+### `/summarize <n>`
+
+Summarize the last N minutes of session activity. The bridge gathers all audit log entries from the specified time window and produces a concise summary including:
+
+- Number of requests in the window
+- Modes used (Agent, Ask, Plan)
+- Tools executed
+- Key prompts and outcomes
+- Errors or timeouts that occurred
+
+**Example:**
+```
+You:     /summarize 30
+Bot:     📋 Session Summary (last 30 min)
+         Requests: 7 | Modes: agent (5), ask (2)
+         Tools: shell, read, write, edit
+         
+         • Fixed auth middleware bug in src/auth/rbac.ts
+         • Ran test suite (247 passed, 0 failed)
+         • Pushed 3 commits to origin/main
+         • Reviewed new PR #42 architecture
+```
+
+**Impact:** When you've been away or had a long session, `/summarize` gives you a quick catchup of what happened without scrolling through chat history.
+
+---
+
 ## Inline Keyboard
+
+> **Telegram only** — Teams does not support inline keyboards in Graph API messages. Use slash commands instead.
 
 The `/status` command shows the bridge state and includes **inline buttons** for quick mode switching:
 
@@ -350,9 +471,9 @@ The bridge runs a background health check every 60 seconds:
 - **Busy-aware**: Skips the check when Copilot is actively processing a request (won't interrupt work)
 - **Lightweight ping**: Calls `listModels()` as a health check on the SDK connection
 - **Auto-reconnect**: If the health check fails, automatically disconnects and reconnects the SDK client
-- **Telegram alerts**: You get a ⚠️ notification when the SDK connection drops and a ✅ when it recovers
+- **Chat alerts**: You get a ⚠️ notification when the SDK connection drops and a ✅ when it recovers
 
-**Impact:** If the SDK process crashes or the connection drops while you're away, the bridge heals itself without intervention. You'll know it happened because of the Telegram alert.
+**Impact:** If the SDK process crashes or the connection drops while you're away, the bridge heals itself without intervention. You'll know it happened because of the chat alert.
 
 ---
 
@@ -575,42 +696,75 @@ You:     Design a microservices architecture for...
 
 **Key features used:** Model listing, model switching (auto-creates new session), idle guard (blocks switch during busy).
 
+### Scenario 9: "Using Teams from the Microsoft corporate network"
+
+You work at Microsoft and can't install Telegram. Teams is already on your phone and laptop.
+
+```
+# First-time setup (once):
+# Set TRANSPORT=teams, TEAMS_RECIPIENT_UPN=myserviceaccount@microsoft.com in .env
+# Run: npm start
+# Browser opens → sign in with your Microsoft account → done
+
+# From your phone, open Teams, find the chat with your service account:
+You:     /help
+Bot:     📋 Available Commands: /help, /status, /mode, ...
+
+You:     /agent
+Bot:     🤖 Agent Mode — Full autonomy enabled.
+
+You:     Build a dashboard component in React showing user analytics
+Bot:     🔄 Working… (5s)
+         🔄 Processing… (13s) [shell, read, write, edit]
+Bot:     🟣 Copilot
+         Created a new React dashboard component at src/components/Dashboard.tsx...
+
+You:     /screenshot http://localhost:3000/dashboard
+Bot:     📸 [inline screenshot of the dashboard]
+```
+
+**Key features used:** Teams transport, corporate auth (OAuth PKCE), all commands work identically to Telegram, inline screenshots via hostedContents.
+
 ---
 
 ## Architecture
 
 ```
-┌────────────┐     ┌──────────────┐     ┌──────────────────────────────────────┐
-│   iPhone    │────▶│  Telegram    │────▶│   Node.js Bridge (your Windows PC)   │
-│  (Telegram) │◀────│    API       │◀────│                                      │
-└────────────┘     └──────────────┘     │  ┌────────┐ ┌──────┐ ┌───────────┐  │
-                                         │  │ bridge │ │ modes│ │ screenshot│  │
-                                         │  │  .js   │ │  .js │ │    .js    │  │
-                                         │  └───┬────┘ └──────┘ └───────────┘  │
-                                         │      │                               │
-                                         │  ┌───▼──────────────────────────┐   │
-                                         │  │ @github/copilot-sdk          │   │
-                                         │  │ (JSON-RPC over stdio)        │   │
-                                         │  └───────────────┬──────────────┘   │
-                                         │                  │                   │
-                                         │  ┌───────────────▼──────────────┐   │
-                                         │  │   copilot.exe (CLI process)  │   │
-                                         │  └──────────────────────────────┘   │
-                                         └──────────────────────────────────────┘
+┌────────────┐     ┌──────────────────┐     ┌──────────────────────────────────────┐
+│   iPhone    │     │  Telegram API    │     │   Node.js Bridge (your Windows PC)   │
+│ (Telegram   │────▶│     — or —       │────▶│                                      │
+│  or Teams)  │◀────│  Microsoft Graph │◀────│  ┌────────┐ ┌──────┐ ┌───────────┐  │
+└────────────┘     │  API (Teams)     │     │  │ bridge │ │ modes│ │ screenshot│  │
+                   └──────────────────┘     │  │  .js   │ │  .js │ │    .js    │  │
+                                             │  └───┬────┘ └──────┘ └───────────┘  │
+                                             │      │                               │
+                                             │  ┌───▼──────────────────────────┐   │
+                                             │  │ @github/copilot-sdk          │   │
+                                             │  │ (JSON-RPC over stdio)        │   │
+                                             │  └───────────────┬──────────────┘   │
+                                             │                  │                   │
+                                             │  ┌───────────────▼──────────────┐   │
+                                             │  │   copilot.exe (CLI process)  │   │
+                                             │  └──────────────────────────────┘   │
+                                             └──────────────────────────────────────┘
 ```
 
 ### Source Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.js` | Entry point — resilient poll loop, shutdown handlers, temp sweeper, health events |
+| `src/index.js` | Entry point — transport factory, resilient poll loop, shutdown handlers, temp sweeper |
 | `src/bridge.js` | Copilot SDK integration — session management, message queue, permission handlers, screenshots |
-| `src/telegram.js` | All Telegram commands, message routing, inline keyboard, progress indicators |
+| `src/telegram.js` | Telegram transport — all commands, message routing, inline keyboard, progress indicators |
+| `src/teams.js` | Teams transport — Graph API polling, command routing, message send/edit/photo |
+| `src/teams-auth.js` | Teams OAuth — PKCE browser flow + device code fallback + token caching |
+| `src/teams-graph.js` | Graph API helpers — graphFetch with retry, ensureChat, postMessage, fetchMessages |
+| `src/teams-formatter.js` | Teams HTML formatting — markdown conversion, Teams-safe HTML subset, chunking |
+| `src/formatter.js` | Telegram HTML formatting — markdown conversion, message chunking (≤4096 chars) |
 | `src/modes.js` | Mode strategy object — single source of truth for permissions, tool exclusions, system prompts |
 | `src/screenshot.js` | Playwright web capture + TCP port detection for auto-detecting dev servers |
 | `src/sessions.js` | Discovers active CLI sessions via WMI process scan + SQLite session store |
-| `src/formatter.js` | Markdown → Telegram HTML conversion, message chunking (≤4096 chars), CLI-style formatting |
-| `src/config.js` | Environment config with auto-detection of copilot.exe (WinGet install path) |
+| `src/config.js` | Environment config with transport selection and auto-detection of copilot.exe |
 | `src/logger.js` | Structured JSON logging with levels, request IDs, and component scoping |
 | `src/audit-log.js` | Append-only JSONL audit log with sensitive data redaction and auto-rotation |
 | `src/platform/windows.js` | Centralized PowerShell/OS helpers for Windows (screenshots, process queries, TCP scans) |
@@ -634,12 +788,16 @@ You:     Design a microservices architecture for...
 
 ## Security
 
-- **User filtering**: Only messages from your configured `TELEGRAM_USER_ID` are accepted — all others silently dropped
+- **User filtering**: Only messages from your configured user are accepted — all others silently dropped
+  - *Telegram*: Filters by `TELEGRAM_USER_ID`
+  - *Teams*: Filters by `from.user.id` (only processes messages from the other participant, not from the bridge's own identity)
 - **Local execution**: The bridge runs on your PC; no cloud relay or third-party servers
-- **Credentials in `.env`**: Bot token and IDs are in `.env` (gitignored), never committed
+- **Credentials in `.env`**: Bot tokens, IDs, and UPNs are in `.env` (gitignored), never committed
+- **Teams token security**: OAuth tokens cached in `~/.copilot/teams-tokens-*.json` with restricted file permissions (0o600 on Unix, ICACLS on Windows)
 - **Audit redaction**: Sensitive values (tokens, passwords, API keys) are automatically scrubbed from audit logs
 - **No full-content logging**: Audit stores only 100-char previews, not complete prompts/responses
-- **Recommended**: Set your bot to private via BotFather (`/setjoingroups` → Disable)
+- **Recommended (Telegram)**: Set your bot to private via BotFather (`/setjoingroups` → Disable)
+- **Recommended (Teams)**: Use a dedicated second account for the chat recipient — cleanly separates bridge identity from phone user
 - **Permission modes**: Use `/ask` or `/plan` when you don't need tool execution — limits blast radius
 
 ---
@@ -658,6 +816,8 @@ npm run test:watch  # Run in watch mode during development
 | Test File | What It Tests |
 |-----------|--------------|
 | `test/formatter.test.js` | HTML escaping, markdown conversion, message chunking, code block splitting |
+| `test/teams-formatter.test.js` | Teams HTML subset conversion, `<em>` vs `<i>`, `<br/>` newlines, 28KB chunking |
+| `test/teams-graph.test.js` | Graph API stripHtml utility, HTML entity decoding, nested tag handling |
 | `test/modes.test.js` | Permission logic for all 3 modes (approve/reject decisions) |
 | `test/modes-strategy.test.js` | Mode strategy object — labels, excluded tools, system suffixes, validation |
 | `test/config.test.js` | Environment config loading, required fields, defaults |
@@ -670,7 +830,7 @@ npm run test:watch  # Run in watch mode during development
 
 | Problem | Solution |
 |---------|----------|
-| **409 Conflict errors** | Another bot instance is polling the same token. Stop the other instance. The bridge auto-retries with backoff and won't count these as crashes. |
+| **409 Conflict errors** (Telegram) | Another bot instance is polling the same token. Stop the other instance. The bridge auto-retries with backoff and won't count these as crashes. |
 | **Permission denied on commands** | You're in Ask or Plan mode. Send `/agent` to switch to full autonomy. |
 | **Timeout on long tasks** | Default is 10 min. Increase `COPILOT_TIMEOUT_SECONDS` in `.env`. Partial results are returned on timeout. |
 | **CLI auth fails** | Run `copilot` manually in a terminal first to complete the OAuth login flow. |
@@ -678,8 +838,14 @@ npm run test:watch  # Run in watch mode during development
 | **SDK connection drops** | Health monitor auto-reconnects every 60s. You'll see a ⚠️ then ✅ notification. |
 | **Model switch fails** | The bridge blocks model switches while busy. Wait for the current request to finish. |
 | **Screenshot shows "no server"** | No dev server detected on ports 3000–9999. Try `/screenshot http://localhost:PORT` with the specific port, or `/screenshot desktop`. |
-| **Bot doesn't respond** | Check bridge console for errors. Verify `.env` values. Ensure the Telegram bot is started (`npm start`). |
+| **Bot doesn't respond** (Telegram) | Check bridge console for errors. Verify `.env` values. Ensure the Telegram bot is started (`npm start`). |
 | **Stale temp files** | The sweeper cleans files older than 1 hour every 30 minutes. Or manually clear `temp/`. |
+| **Teams OAuth window doesn't open** | The browser may be blocked. Copy the URL from the console and open it manually. Or set `TEAMS_CLIENT_ID` to a custom Entra app if Conditional Access blocks the default. |
+| **Teams "interaction_required" error** | Token expired permanently. Delete `~/.copilot/teams-tokens-*.json` and restart — a fresh browser login will be triggered. |
+| **Teams messages not appearing** | Check that `TEAMS_RECIPIENT_UPN` is correct and the bridge user has `Chat.ReadWrite` permission. Try setting `TEAMS_CHAT_ID` directly if auto-chat-creation fails. |
+| **Teams Conditional Access block** | Your tenant may block the first-party Graph PowerShell client ID. Set `TEAMS_CLIENT_ID` to a custom Entra app registration (just needs app ID + localhost redirect URI). |
+| **Teams "device code" prompt** | In headless/SSH environments, the bridge falls back to device code flow. Navigate to the displayed URL on any device and enter the code. |
+| **Teams poll rate limiting (429)** | The bridge auto-retries with exponential backoff. If persistent, increase `TEAMS_POLL_INTERVAL_MS` (default: 3000ms). |
 
 ---
 
