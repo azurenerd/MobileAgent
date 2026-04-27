@@ -50,7 +50,7 @@ function buildTelegramConfig() {
 
 function buildTeamsConfig() {
   return {
-    clientId: optional('TEAMS_CLIENT_ID', '14d82eec-204b-4c2f-b7e8-296a70dab67e'),
+    clientId: optional('TEAMS_CLIENT_ID', 'de8bc8b5-d9f9-48b1-a8ad-b748da725064'),
     tenantId: optional('TEAMS_TENANT_ID', 'organizations'),
     recipientUpn: optional('TEAMS_RECIPIENT_UPN', 'me'),
     chatId: optional('TEAMS_CHAT_ID', ''),

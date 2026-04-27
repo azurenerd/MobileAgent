@@ -128,6 +128,8 @@ You'll see a startup message on your phone:
 
 ## Quick Start — Teams
 
+> ⚠️ **Corporate Tenant Limitation:** Microsoft's own corporate tenant (and some other highly-secured tenants) requires **admin consent** for Chat permissions (`Chat.ReadWrite`). If you see "Need admin approval" or error 53003, your tenant's Conditional Access policy blocks delegated chat access. The Teams transport works in tenants where users can self-consent to Chat permissions. See [Troubleshooting](#troubleshooting) for details.
+
 ### 1. Authenticate Copilot CLI
 
 Same as Telegram — run `copilot` once in a terminal to complete the GitHub OAuth login.
@@ -143,14 +145,22 @@ Edit `.env` with Teams settings:
 
 ```env
 TRANSPORT=teams
-TEAMS_RECIPIENT_UPN=your-other-account@microsoft.com
+TEAMS_RECIPIENT_UPN=me
 COPILOT_MODEL=claude-sonnet-4
 COPILOT_TIMEOUT_SECONDS=600
 ```
 
-**`TEAMS_RECIPIENT_UPN`** is the email address of the Teams user you'll chat with. This should be a **different** account from the one running the bridge (e.g., a second Microsoft account or a shared mailbox). This creates a 1:1 chat where you message from your phone and the bridge posts responses.
+**`TEAMS_RECIPIENT_UPN=me`** uses self-chat mode (simplest setup — message yourself in Teams). Alternatively, set it to another user's email for a 1:1 chat.
 
-### 3. Install & Run
+### 3. Prerequisites — Tenant Permissions
+
+The Teams transport uses Microsoft Graph API with delegated `Chat.ReadWrite` permission. This requires:
+- Your tenant allows users to consent to Chat permissions (or an admin has pre-consented)
+- No Conditional Access policy blocking the app
+
+**To check:** Try signing in at https://developer.microsoft.com/en-us/graph/graph-explorer and request `Chat.ReadWrite` scope. If you get "Need admin approval", your tenant requires admin consent.
+
+### 4. Install & Run
 
 ```powershell
 npm install
@@ -158,13 +168,20 @@ npx playwright install chromium   # for /screenshot feature
 npm start
 ```
 
-On first run, a **browser window opens** for Microsoft OAuth login. Sign in with your corporate account and grant the requested permissions. Tokens are cached in `~/.copilot/teams-tokens-*.json` and auto-refresh — you won't need to sign in again unless tokens expire permanently.
+On first run, a **browser window opens** for Microsoft OAuth login. Sign in and grant the requested permissions. Tokens are cached and auto-refresh.
 
-**Headless/SSH fallback:** If no browser is available, the bridge displays a device code and URL. Navigate to the URL on any device and enter the code.
+**Headless/SSH fallback:** If no browser is available, the bridge displays a device code and URL.
 
-> ✅ Copilot Mobile v3 online! Session: a1b2c3d4… Model: claude-sonnet-4. Transport: Teams. Send /help for commands.
+> ✅ Copilot Mobile v3 online! Session: a1b2c3d4… Model: claude-sonnet-4. Transport: Teams.
 
-Open the Teams app on your phone, go to the 1:1 chat with the recipient account, and send `/help` to get started.
+### Custom App Registration (if needed)
+
+If the default app IDs are blocked, register your own in Entra:
+1. Go to https://entra.microsoft.com → App registrations → New registration
+2. Name: "Copilot Mobile Bridge", Redirect URI: `http://localhost` (Public client)
+3. API permissions: Add `Chat.ReadWrite` and `User.Read` (delegated)
+4. Request admin consent if required by your tenant
+5. Set `TEAMS_CLIENT_ID=<your-app-id>` in `.env`
 
 ---
 
@@ -843,7 +860,8 @@ npm run test:watch  # Run in watch mode during development
 | **Teams OAuth window doesn't open** | The browser may be blocked. Copy the URL from the console and open it manually. Or set `TEAMS_CLIENT_ID` to a custom Entra app if Conditional Access blocks the default. |
 | **Teams "interaction_required" error** | Token expired permanently. Delete `~/.copilot/teams-tokens-*.json` and restart — a fresh browser login will be triggered. |
 | **Teams messages not appearing** | Check that `TEAMS_RECIPIENT_UPN` is correct and the bridge user has `Chat.ReadWrite` permission. Try setting `TEAMS_CHAT_ID` directly if auto-chat-creation fails. |
-| **Teams Conditional Access block** | Your tenant may block the first-party Graph PowerShell client ID. Set `TEAMS_CLIENT_ID` to a custom Entra app registration (just needs app ID + localhost redirect URI). |
+| **Teams Conditional Access block (53003)** | Microsoft's corporate tenant (and other strict tenants) block Chat permissions entirely via Conditional Access. You need admin consent or a custom Entra app with pre-approved Chat.ReadWrite. Set `TEAMS_CLIENT_ID` to your custom app. This is a tenant-level restriction, not an app issue. |
+| **Teams "Need admin approval"** | Your tenant requires admin consent for Chat.ReadWrite scope. Options: (1) Request admin consent via your IT portal, (2) Register a custom app and have an admin grant permissions, (3) Use Telegram transport instead. |
 | **Teams "device code" prompt** | In headless/SSH environments, the bridge falls back to device code flow. Navigate to the displayed URL on any device and enter the code. |
 | **Teams poll rate limiting (429)** | The bridge auto-retries with exponential backoff. If persistent, increase `TEAMS_POLL_INTERVAL_MS` (default: 3000ms). |
 

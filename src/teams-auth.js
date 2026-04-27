@@ -23,7 +23,7 @@ const log = createLogger('teams-auth');
 
 // ─── Constants ──────────────────────────────────────────────────────
 
-const SCOPES = 'Chat.ReadWrite ChatMessage.Send ChatMessage.Read User.Read offline_access';
+const SCOPES = 'Chat.ReadWrite User.Read offline_access';
 const TOKEN_DIR = join(homedir(), '.copilot');
 const PERMANENT_AUTH_ERRORS = ['invalid_grant', 'interaction_required', 'consent_required', 'invalid_client'];
 
