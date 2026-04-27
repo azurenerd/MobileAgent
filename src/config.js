@@ -52,7 +52,7 @@ function buildTeamsConfig() {
   return {
     clientId: optional('TEAMS_CLIENT_ID', '14d82eec-204b-4c2f-b7e8-296a70dab67e'),
     tenantId: optional('TEAMS_TENANT_ID', 'organizations'),
-    recipientUpn: optional('TEAMS_RECIPIENT_UPN', ''),
+    recipientUpn: optional('TEAMS_RECIPIENT_UPN', 'me'),
     chatId: optional('TEAMS_CHAT_ID', ''),
     pollIntervalMs: Number(optional('TEAMS_POLL_INTERVAL_MS', '3000')),
   };

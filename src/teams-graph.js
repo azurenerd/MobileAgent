@@ -75,14 +75,50 @@ export async function getMe(accessToken) {
 // ─── Chat Operations ────────────────────────────────────────────────
 
 /**
+ * Find the user's self-chat ("Message yourself" in Teams).
+ * Scans existing chats for a oneOnOne where the user is talking to themselves.
+ * Returns the chat ID or null if not found.
+ */
+export async function findSelfChat(accessToken, myUserId) {
+  // Fetch recent 1:1 chats and find one where we are the only real participant
+  const res = await graphFetch(
+    `${GRAPH_BASE}/me/chats?$filter=chatType eq 'oneOnOne'&$top=50&$expand=members`,
+    accessToken
+  );
+
+  if (!res?.value) return null;
+
+  for (const chat of res.value) {
+    const members = chat.members || [];
+    // Self-chat: only has 1 member (yourself) or 2 members that are both you
+    const uniqueUserIds = new Set(
+      members
+        .filter(m => m.userId)
+        .map(m => m.userId)
+    );
+    if (uniqueUserIds.size === 1 && uniqueUserIds.has(myUserId)) {
+      return chat.id;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Find or create a 1:1 chat with the recipient.
+ * If recipientUpn is 'me', auto-discovers the self-chat.
  * If chatId is already known, returns it immediately.
  */
 export async function ensureChat(accessToken, { recipientUpn, chatId, myUserId }) {
   if (chatId) return chatId;
 
-  if (!recipientUpn) {
-    throw new Error('Teams requires TEAMS_RECIPIENT_UPN or TEAMS_CHAT_ID to be set.');
+  // Self-chat mode: auto-discover
+  if (!recipientUpn || recipientUpn === 'me') {
+    const selfChatId = await findSelfChat(accessToken, myUserId);
+    if (selfChatId) return selfChatId;
+    throw new Error(
+      'Could not find your Teams self-chat. Open Teams, go to "Chat", and send yourself a message first. Then restart the bridge.'
+    );
   }
 
   const safeUpn = validateGraphId(recipientUpn, 'recipientUpn');

@@ -75,9 +75,11 @@ export function createTeamsBot(bridge) {
   const auth = new TeamsAuth(config.teams.clientId, config.teams.tenantId);
   let chatId = config.teams.chatId || null;
   let myUserId = null;
+  let isSelfChat = false; // true when recipientUpn is 'me' (self-chat mode)
   let pollingActive = false;
   let pollTimer = null;
   const processedIds = new LruSet(500);
+  const sentByBridge = new LruSet(200); // message IDs posted by this bridge instance
 
   // Load persisted watermark
   const watermark = loadWatermark();
@@ -93,6 +95,7 @@ export function createTeamsBot(bridge) {
       try {
         const accessToken = await auth.ensureAuthenticated();
         lastMsg = await postMessage(accessToken, targetChatId, chunk);
+        if (lastMsg?.id) sentByBridge.add(lastMsg.id);
       } catch (err) {
         log.error('Failed to send Teams message:', err.message);
       }
@@ -106,7 +109,8 @@ export function createTeamsBot(bridge) {
       const accessToken = await auth.ensureAuthenticated();
       await graphEditMessage(accessToken, targetChatId, messageId, chunks[0]);
       for (let i = 1; i < chunks.length; i++) {
-        await postMessage(accessToken, targetChatId, chunks[i]);
+        const overflow = await postMessage(accessToken, targetChatId, chunks[i]);
+        if (overflow?.id) sentByBridge.add(overflow.id);
       }
     } catch (err) {
       log.warn('Edit failed, sending new message:', err.message);
@@ -117,7 +121,9 @@ export function createTeamsBot(bridge) {
   async function sendPhoto(targetChatId, filePath, caption = '') {
     try {
       const accessToken = await auth.ensureAuthenticated();
-      return await postMessageWithImage(accessToken, targetChatId, '', filePath, caption);
+      const msg = await postMessageWithImage(accessToken, targetChatId, '', filePath, caption);
+      if (msg?.id) sentByBridge.add(msg.id);
+      return msg;
     } catch (err) {
       log.error('Failed to send photo:', err.message);
       await sendHtml(targetChatId, formatSystem(`❌ Photo send failed: ${err.message}`));
@@ -512,11 +518,21 @@ export function createTeamsBot(bridge) {
         // Skip already-processed messages
         if (processedIds.has(msg.id)) continue;
 
-        // Skip our own messages
-        const senderId = msg.from?.user?.id;
-        if (!senderId || senderId === myUserId) {
+        // Skip messages posted by the bridge itself (tracked in sentByBridge)
+        if (sentByBridge.has(msg.id)) {
           processedIds.add(msg.id);
           continue;
+        }
+
+        // In self-chat mode: all messages are from us, so skip bridge-posted ones
+        // In normal mode: skip messages from our own user ID (bridge responses)
+        const senderId = msg.from?.user?.id;
+        if (!isSelfChat) {
+          // Normal mode: skip our own messages
+          if (!senderId || senderId === myUserId) {
+            processedIds.add(msg.id);
+            continue;
+          }
         }
 
         // Skip system messages
@@ -602,15 +618,26 @@ export function createTeamsBot(bridge) {
     auth.setMyUserId(me.id);
     log.info(`Authenticated as: ${me.displayName} (${me.userPrincipalName})`);
 
+    // Determine if self-chat mode
+    const recipientUpn = config.teams.recipientUpn;
+    isSelfChat = !recipientUpn || recipientUpn === 'me';
+
     // Ensure chat exists
     if (!chatId) {
-      log.info(`Creating/finding chat with ${config.teams.recipientUpn}…`);
+      if (isSelfChat) {
+        log.info('Self-chat mode — finding your "Message yourself" chat…');
+      } else {
+        log.info(`Creating/finding chat with ${recipientUpn}…`);
+      }
       chatId = await ensureChat(accessToken, {
-        recipientUpn: config.teams.recipientUpn,
+        recipientUpn,
         chatId: config.teams.chatId,
         myUserId,
       });
       log.info(`Chat ID: ${chatId}`);
+      if (isSelfChat) {
+        log.info('✅ Self-chat discovered. Send messages to yourself in Teams and the bridge will respond.');
+      }
     }
 
     // Set watermark to now if first run (skip existing messages)
